@@ -4,4 +4,6 @@ this script allows to change avatar locally for yourself at r6 and r15 roblox of
 
 
 # known issues (to me) 
-genually zero i suspect a performance drop on some devices from this script but im not sure 
+<img width="1920" height="1080" alt="Screenshot_2026-11-24_21-32-32" src="https://github.com/user-attachments/assets/2d6c47c3-059e-47f6-98f4-386f8058cdc3" />
+
+only one  the animation i will change that it will only show for local and i suspect a performance drop on some devices from this script but im not sure 
