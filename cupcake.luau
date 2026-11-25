@@ -4368,7 +4368,7 @@ local function makeGui()
 
     refreshGrid = function()
         for _, child in pairs(grid:GetChildren()) do
-            if child:IsA("Frame") or (child:IsA("TextLabel") and child.Name == "EmptyHint") or (child:IsA("TextButton") and child.Name == "AddCard") then child:Destroy() end
+            if child:IsA("Frame") or (child:IsA("TextButton") and child.Name == "AddCard") then child:Destroy() end
         end
 
         local char = player.Character
@@ -4377,33 +4377,16 @@ local function makeGui()
         local currentRigKnown = humanoid ~= nil
 
         local names = {}
-        local hiddenCount = 0
         for name, data in pairs(savedAvatars) do
             local isR6 = tostring(data.rigType or ""):find("R6") ~= nil
             local compatible = (not currentRigKnown) or (currentIsR6 == isR6)
             if (not settings.hideIncompatible) or compatible then
                 table.insert(names, name)
-            else
-                hiddenCount = hiddenCount + 1
             end
         end
         table.sort(names, function(a, b) return a:lower() < b:lower() end)
         for i, name in ipairs(names) do
             createAvatarGridCard(name, savedAvatars[name], i)
-        end
-        if #names == 0 and hiddenCount > 0 then
-            local hint = Instance.new("TextLabel")
-            hint.Name = "EmptyHint"
-            hint.Size = UDim2.new(1, -8, 0, 48)
-            hint.BackgroundTransparency = 1
-            hint.Text = "No " .. (currentIsR6 and "R6" or "R15") .. " avatars saved. Turn off Hide incompatible in Settings to show all."
-            hint.TextColor3 = M3.OnSurfaceFaint
-            hint.TextSize = 11
-            hint.Font = Enum.Font.Gotham
-            hint.TextWrapped = true
-            hint.LayoutOrder = 0
-            hint.ZIndex = 2
-            hint.Parent = grid
         end
         createAddCard(#names + 1)
     end
