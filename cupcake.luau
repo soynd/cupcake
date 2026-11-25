@@ -5477,3 +5477,4 @@ local function reapplyOnRespawn(char)
 end
 
 respawnConn = player.CharacterAdded:Connect(reapplyOnRespawn)
+print("github test")
