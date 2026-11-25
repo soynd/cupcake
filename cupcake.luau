@@ -13,7 +13,7 @@ local SETTINGS_PATH = "cupcake_settings.json"
 local RELOAD_URL = ""
 local CATALOG_PLACE_ID = 7041939546
 local GITHUB_URL = "https://github.com/soynd/cupcake"
-local UPDATE_DATE = "November 24, 2026"
+local UPDATE_DATE = "November 25, 2026"
 
 local settings = {
     keepOnRespawn = false,
@@ -1500,6 +1500,18 @@ local function isAnimatedJoint(obj)
     return obj:IsA("Motor6D") or obj:IsA("AnimationConstraint")
 end
 
+local function animationPath(animate, animObj)
+    if not animate or not animObj then return nil end
+    local pathParts = {}
+    local current = animObj
+    while current and current ~= animate do
+        table.insert(pathParts, 1, current.Name)
+        current = current.Parent
+    end
+    if current ~= animate then return nil end
+    return table.concat(pathParts, "/")
+end
+
 local FOOT_NAMES = {"LeftFoot", "RightFoot", "Left Leg", "Right Leg"}
 
 local function collectFeet(character)
@@ -1597,7 +1609,10 @@ local function applyFollower(char, humanoid, data)
         pcall(function() cloneHum.MaxHealth = 1e9 end)
         pcall(function() cloneHum.Health = 1e9 end)
         local animator = cloneHum:FindFirstChildOfClass("Animator")
-        if animator then pcall(function() animator:Destroy() end) end
+        if not animator and type(data.animations) == "table" and next(data.animations) ~= nil then
+            animator = Instance.new("Animator")
+            animator.Parent = cloneHum
+        end
     end
 
     local visibleCore = 0
@@ -1774,6 +1789,10 @@ local function applyFollower(char, humanoid, data)
         dropOffset = dropOffset, links = links, humanoid = cloneHum,
         parts = decoyParts, decoyFeet = decoyFeet, realFeet = realFeet,
         head = head, headDecals = headDecals, headParts = headParts,
+        realHumanoid = humanoid, animate = char:FindFirstChild("Animate"),
+        savedAnims = (type(data.animations) == "table") and data.animations or nil,
+        decoyAnimator = cloneHum and cloneHum:FindFirstChildOfClass("Animator") or nil,
+        animTracks = {},
         conn = nil, descConn = nil, dropReady = false,
         headHidden = false, hideAt = 0, maintAt = 0,
     }
@@ -1795,8 +1814,14 @@ local function applyFollower(char, humanoid, data)
     if cloneHum then
         pcall(function() cloneHum:SetStateEnabled(Enum.HumanoidStateType.Physics, true) end)
         pcall(function() cloneHum:ChangeState(Enum.HumanoidStateType.Physics) end)
-        local anim = cloneHum:FindFirstChildOfClass("Animator")
-        if anim then pcall(function() anim:Destroy() end) end
+    end
+
+    if state.savedAnims and state.decoyAnimator then
+        for _, p in ipairs(state.parts) do
+            if p ~= cloneRoot and not p:FindFirstAncestorOfClass("Accessory") then
+                pcall(function() p.Anchored = false end)
+            end
+        end
     end
 
     for _, d in ipairs(char:GetDescendants()) do hideInstance(d) end
@@ -1807,6 +1832,81 @@ local function applyFollower(char, humanoid, data)
             for _, c in ipairs(d:GetDescendants()) do hideInstance(c) end
         end
     end)
+
+    local function stopAnimEntry(entry)
+        if not entry then return end
+        pcall(function() entry.track:Stop(0.1) end)
+        pcall(function() entry.anim:Destroy() end)
+    end
+
+    local function syncDecoyAnimations(f)
+        if not f.savedAnims or not f.decoyAnimator then return false end
+        local realAnimator = f.realHumanoid and f.realHumanoid:FindFirstChildOfClass("Animator")
+        if not realAnimator then return false end
+
+        local realTracks = realAnimator:GetPlayingAnimationTracks()
+        local playing = {}
+        local active = 0
+
+        for _, realTrack in ipairs(realTracks) do
+            local source = realTrack.Animation
+            if source then
+                playing[realTrack] = true
+                local path = animationPath(f.animate, source)
+                local id = path and f.savedAnims[path] or nil
+                if type(id) ~= "string" or id == "" then id = source.AnimationId end
+
+                local entry = f.animTracks[realTrack]
+                if entry and entry.id ~= id then
+                    stopAnimEntry(entry)
+                    f.animTracks[realTrack] = nil
+                    entry = nil
+                end
+
+                if not entry then
+                    local sourceAnim = Instance.new("Animation")
+                    sourceAnim.Name = "CupcakeAnim"
+                    sourceAnim.AnimationId = id
+                    sourceAnim.Parent = f.model
+
+                    local decoyTrack
+                    local loaded = pcall(function()
+                        decoyTrack = f.decoyAnimator:LoadAnimation(sourceAnim)
+                    end)
+                    if loaded and decoyTrack then
+                        entry = {track = decoyTrack, anim = sourceAnim, id = id}
+                        f.animTracks[realTrack] = entry
+                        pcall(function() decoyTrack.Looped = true end)
+                        pcall(function() decoyTrack.Priority = realTrack.Priority end)
+                        pcall(function() decoyTrack:Play(0, 1, 0) end)
+                    else
+                        pcall(function() sourceAnim:Destroy() end)
+                    end
+                end
+
+                if entry then
+                    active = active + 1
+                    pcall(function()
+                        if not entry.track.IsPlaying then
+                            entry.track:Play(0, 1, 0)
+                        end
+                        entry.track:AdjustSpeed(realTrack.Speed)
+                        entry.track:AdjustWeight(realTrack.WeightCurrent, 0)
+                        entry.track.TimePosition = realTrack.TimePosition
+                    end)
+                end
+            end
+        end
+
+        for realTrack, entry in pairs(f.animTracks) do
+            if not playing[realTrack] then
+                stopAnimEntry(entry)
+                f.animTracks[realTrack] = nil
+            end
+        end
+
+        return active > 0
+    end
 
     local function step()
         local f = follower
@@ -1843,8 +1943,6 @@ local function applyFollower(char, humanoid, data)
         if now - f.maintAt > 0.5 then
             f.maintAt = now
             if f.humanoid and f.humanoid.Parent then
-                local anim = f.humanoid:FindFirstChildOfClass("Animator")
-                if anim then pcall(function() anim:Destroy() end) end
                 if f.humanoid:GetState() ~= Enum.HumanoidStateType.Physics then
                     pcall(function() f.humanoid:ChangeState(Enum.HumanoidStateType.Physics) end)
                 end
@@ -1852,6 +1950,10 @@ local function applyFollower(char, humanoid, data)
             for _, p in ipairs(f.parts) do
                 if p.Parent then
                     if p:FindFirstAncestorOfClass("Accessory") then
+                        if p.Anchored then p.Anchored = false end
+                    elseif p == f.root then
+                        if not p.Anchored then p.Anchored = true end
+                    elseif f.savedAnims and f.decoyAnimator then
                         if p.Anchored then p.Anchored = false end
                     elseif not p.Anchored then
                         p.Anchored = true
@@ -1879,14 +1981,17 @@ local function applyFollower(char, humanoid, data)
         f.dropReady = true
 
         f.root.CFrame = f.realRoot.CFrame + Vector3.new(0, f.dropOffset, 0)
-        for _, l in ipairs(f.links) do
-            local real = l.real
-            if real and real.Parent then
-                local t = real.Transform
-                if l.reversed then t = t:Inverse() end
-                l.child.CFrame = l.parent.CFrame * l.pre * t * l.post
-            else
-                l.child.CFrame = l.parent.CFrame * l.pre * l.post
+        local animDriving = syncDecoyAnimations(f)
+        if not animDriving then
+            for _, l in ipairs(f.links) do
+                local real = l.real
+                if real and real.Parent then
+                    local t = real.Transform
+                    if l.reversed then t = t:Inverse() end
+                    l.child.CFrame = l.parent.CFrame * l.pre * t * l.post
+                else
+                    l.child.CFrame = l.parent.CFrame * l.pre * l.post
+                end
             end
         end
 
@@ -1913,7 +2018,8 @@ local function applyFollower(char, humanoid, data)
     applyingFollower = false
     local realKind = links[1] and links[1].real.ClassName or "none"
     local decoyKind = links[1] and links[1].jointClass or "none"
-    print("[Cupcake] R15 decoy ready (" .. tostring(#links) .. " joint links, " .. realKind .. " -> " .. decoyKind .. ", FK pose)")
+    local poseMode = (state.savedAnims and state.decoyAnimator) and "local animations" or "FK pose"
+    print("[Cupcake] R15 decoy ready (" .. tostring(#links) .. " joint links, " .. realKind .. " -> " .. decoyKind .. ", " .. poseMode .. ")")
     return true
 end
 
@@ -1937,48 +2043,6 @@ local function restartAnimate(char, animate)
     task.wait()
     pcall(function() animate.Disabled = false end)
     return true
-end
-
-local function applySavedAnimations(char, data)
-    if not char or type(data) ~= "table" then return 0 end
-    local anims = data.animations
-    if type(anims) ~= "table" or next(anims) == nil then return 0 end
-    local animate = char:FindFirstChild("Animate")
-    if not animate then return 0 end
-
-    local function getAnimPath(animObj)
-        local pathParts = {}
-        local current = animObj
-        while current and current ~= animate do
-            table.insert(pathParts, 1, current.Name)
-            current = current.Parent
-        end
-        return table.concat(pathParts, "/")
-    end
-
-    local applied = 0
-    local matched = 0
-    for _, obj in pairs(animate:GetDescendants()) do
-        if obj:IsA("Animation") then
-            local path = getAnimPath(obj)
-            local id = anims[path]
-            if id and id ~= "" then
-                matched = matched + 1
-                if obj.AnimationId ~= id then
-                    if obj:GetAttribute(ORIG_ANIM_ATTR) == nil then
-                        pcall(function() obj:SetAttribute(ORIG_ANIM_ATTR, obj.AnimationId) end)
-                    end
-                    pcall(function() obj.AnimationId = id end)
-                    applied = applied + 1
-                end
-            end
-        end
-    end
-
-    if applied > 0 then
-        restartAnimate(char, animate)
-    end
-    return applied, matched
 end
 
 local function restoreOriginalAnimations(char)
@@ -2060,12 +2124,6 @@ local function LoadAvatarFromData(data)
     if not isR6 then
         local called, result = pcall(applyFollower, char, humanoid, data)
         if called and result then
-            local animCount, animMatched = applySavedAnimations(char, data)
-            if animCount > 0 then
-                print("[Cupcake] R15 saved animations applied (" .. tostring(animCount) .. ")")
-            elseif animMatched == 0 and type(data.animations) == "table" and next(data.animations) ~= nil then
-                warn("[Cupcake] R15 saved animations found, but no matching Animate entries")
-            end
             return
         end
 
@@ -4051,40 +4109,73 @@ local function makeGui()
     end)
     snowToggle.Position = UDim2.new(1, -58, 0.5, -12)
 
-    local unloadRow = Instance.new("TextButton")
-    unloadRow.Name = "UnloadScript"
-    unloadRow.Size = UDim2.new(1, -8, 0, 44)
+    local unloadRow = Instance.new("Frame")
+    unloadRow.Name = "Row_Unload"
+    unloadRow.Size = UDim2.new(1, -8, 0, 48)
     unloadRow.Position = UDim2.new(0, 4, 0, 384)
-    unloadRow.BackgroundColor3 = M3.ErrorContainer
-    unloadRow.BackgroundTransparency = 0.15
+    unloadRow.BackgroundColor3 = M3.Surface
+    unloadRow.BackgroundTransparency = 0.55
     unloadRow.BorderSizePixel = 0
-    unloadRow.Text = "Unload script"
-    unloadRow.TextColor3 = M3.Error
-    unloadRow.TextSize = 13
-    unloadRow.Font = Enum.Font.GothamBold
-    unloadRow.AutoButtonColor = false
     unloadRow.ZIndex = 2
     unloadRow.Parent = settingsPage
     corner(12, unloadRow)
-    local unloadStroke = stroke(M3.Error, 1, unloadRow, 0.6)
+    stroke(M3.GlassLine, 1, unloadRow, 0.9)
+    frost(unloadRow, 12)
 
-    unloadRow.MouseEnter:Connect(function()
-        tween(unloadRow, {
-            BackgroundColor3 = Color3.fromRGB(88, 44, 49),
-            BackgroundTransparency = 0,
-            TextColor3 = M3.Accent,
-        }, 0.12)
-        tween(unloadStroke, {Transparency = 0.2}, 0.12)
+    local unloadLabel = Instance.new("TextLabel")
+    unloadLabel.Name = "Label"
+    unloadLabel.Size = UDim2.new(1, -110, 0, 16)
+    unloadLabel.Position = UDim2.new(0, 14, 0, 7)
+    unloadLabel.BackgroundTransparency = 1
+    unloadLabel.Text = "Unload script"
+    unloadLabel.TextColor3 = M3.OnSurface
+    unloadLabel.TextSize = 13
+    unloadLabel.Font = Enum.Font.GothamMedium
+    unloadLabel.TextXAlignment = Enum.TextXAlignment.Left
+    unloadLabel.ZIndex = 3
+    unloadLabel.Parent = unloadRow
+
+    local unloadHint = Instance.new("TextLabel")
+    unloadHint.Name = "Hint"
+    unloadHint.Size = UDim2.new(1, -110, 0, 14)
+    unloadHint.Position = UDim2.new(0, 14, 0, 25)
+    unloadHint.BackgroundTransparency = 1
+    unloadHint.Text = "Close Cupcake and restore your avatar"
+    unloadHint.TextColor3 = M3.OnSurfaceFaint
+    unloadHint.TextSize = 10
+    unloadHint.Font = Enum.Font.Gotham
+    unloadHint.TextXAlignment = Enum.TextXAlignment.Left
+    unloadHint.ZIndex = 3
+    unloadHint.Parent = unloadRow
+
+    local unloadBtn = Instance.new("TextButton")
+    unloadBtn.Name = "Unload"
+    unloadBtn.Size = UDim2.new(0, 78, 0, 26)
+    unloadBtn.Position = UDim2.new(1, -92, 0.5, -13)
+    unloadBtn.BackgroundColor3 = M3.ErrorContainer
+    unloadBtn.BackgroundTransparency = 1
+    unloadBtn.BorderSizePixel = 0
+    unloadBtn.Text = "Unload"
+    unloadBtn.TextColor3 = M3.Error
+    unloadBtn.TextSize = 11
+    unloadBtn.Font = Enum.Font.GothamBold
+    unloadBtn.AutoButtonColor = false
+    unloadBtn.ZIndex = 3
+    unloadBtn.Parent = unloadRow
+    corner(8, unloadBtn)
+    local unloadStroke = stroke(M3.Error, 1, unloadBtn, 0.55)
+
+    unloadBtn.MouseEnter:Connect(function()
+        tween(unloadBtn, {BackgroundTransparency = 0.75}, 0.12)
+        tween(unloadBtn, {TextColor3 = M3.Accent}, 0.12)
+        tween(unloadStroke, {Transparency = 0.15}, 0.12)
     end)
-    unloadRow.MouseLeave:Connect(function()
-        tween(unloadRow, {
-            BackgroundColor3 = M3.ErrorContainer,
-            BackgroundTransparency = 0.15,
-            TextColor3 = M3.Error,
-        }, 0.15)
-        tween(unloadStroke, {Transparency = 0.6}, 0.15)
+    unloadBtn.MouseLeave:Connect(function()
+        tween(unloadBtn, {BackgroundTransparency = 1}, 0.15)
+        tween(unloadBtn, {TextColor3 = M3.Error}, 0.15)
+        tween(unloadStroke, {Transparency = 0.55}, 0.15)
     end)
-    unloadRow.MouseButton1Click:Connect(function()
+    unloadBtn.MouseButton1Click:Connect(function()
         unloadScript()
     end)
 
@@ -4350,6 +4441,7 @@ local function makeGui()
     end)
 
     local function animateSheetOpen(overlay, box, extras)
+        local finalTransparency = box.BackgroundTransparency
         overlay.BackgroundTransparency = 1
         box.BackgroundTransparency = 1
         local finalPos = box.Position
@@ -4360,7 +4452,7 @@ local function makeGui()
             elseif el.Prop == "Bg" then el.Obj.BackgroundTransparency = 1 end
         end
         tween(overlay, {BackgroundTransparency = 0.45}, 0.16)
-        tween(box, {BackgroundTransparency = 0.5, Position = finalPos}, 0.2, Enum.EasingStyle.Quart)
+        tween(box, {BackgroundTransparency = finalTransparency, Position = finalPos}, 0.2, Enum.EasingStyle.Quart)
         task.delay(0.05, function()
             for _, el in ipairs(extras or {}) do
                 if el.Prop == "Stroke" then tween(el.Obj, {Transparency = el.To}, 0.16)
@@ -4393,14 +4485,27 @@ local function makeGui()
     modalBox.Size = UDim2.new(0, 300, 0, 286)
     modalBox.Position = UDim2.new(0.5, -150, 0.5, -143)
     modalBox.BackgroundColor3 = M3.Surface
-    modalBox.BackgroundTransparency = 0.7
+    modalBox.BackgroundTransparency = 0.06
     modalBox.BorderSizePixel = 0
     modalBox.ZIndex = 101
     modalBox.ClipsDescendants = true
     modalBox.Parent = modal
     corner(14, modalBox)
-    local modalBoxStroke = stroke(M3.GlassLine, 1, modalBox, 0.86)
-    frost(modalBox, 14)
+    local modalBoxStroke = stroke(M3.GlassLine, 1, modalBox, 0.74)
+
+    local modalGrad = Instance.new("UIGradient")
+    modalGrad.Name = "ModalGrad"
+    modalGrad.Rotation = 90
+    modalGrad.Color = ColorSequence.new({
+        ColorSequenceKeypoint.new(0, Color3.fromRGB(68, 72, 80)),
+        ColorSequenceKeypoint.new(0.5, Color3.fromRGB(50, 53, 60)),
+        ColorSequenceKeypoint.new(1, Color3.fromRGB(36, 38, 44)),
+    })
+    modalGrad.Transparency = NumberSequence.new({
+        NumberSequenceKeypoint.new(0, 0.02),
+        NumberSequenceKeypoint.new(1, 0.3),
+    })
+    modalGrad.Parent = modalBox
 
     local modalBoxBlocker = Instance.new("TextButton")
     modalBoxBlocker.Name = "Blocker"
@@ -4454,7 +4559,7 @@ local function makeGui()
         1.1,
         0.4
     )
-    gradientLine(modalBox, UDim2.new(1, -40, 0, 1), UDim2.new(0, 20, 0, 82), 102, 1.5, 0.9)
+    local modalGradientLine = gradientLine(modalBox, UDim2.new(1, -40, 0, 1), UDim2.new(0, 20, 0, 82), 102, 1.5, 0.9)
 
     local btnTabSave = Instance.new("TextButton")
     btnTabSave.Name = "TabSave"
@@ -4655,7 +4760,7 @@ local function makeGui()
 
     populatePlayerList = function()
         for _, c in pairs(playerList:GetChildren()) do
-            if c:IsA("TextButton") or c:IsA("TextLabel") then c:Destroy() end
+            if c:IsA("TextButton") or c:IsA("TextLabel") or c:IsA("Frame") then c:Destroy() end
         end
         local others = 0
         for _, plr in pairs(Players:GetPlayers()) do
@@ -4663,33 +4768,99 @@ local function makeGui()
                 others = others + 1
                 local row = Instance.new("TextButton")
                 row.Name = "PlayerRow_" .. plr.Name
-                row.Size = UDim2.new(1, 0, 0, 34)
-                row.BackgroundColor3 = M3.SurfaceHighest
-                row.BackgroundTransparency = 0.6
-                row.Text = (plr.DisplayName ~= plr.Name) and (plr.DisplayName .. "  @" .. plr.Name) or plr.Name
-                row.TextColor3 = M3.OnSurface
-                row.TextSize = 12
-                row.Font = Enum.Font.GothamMedium
+                row.Size = UDim2.new(1, 0, 0, 44)
+                row.BackgroundColor3 = M3.SurfaceHigh
+                row.BackgroundTransparency = 0.4
+                row.Text = ""
                 row.AutoButtonColor = false
                 row.ZIndex = 103
                 row.Parent = playerList
-                corner(9, row)
-                local baseText = row.Text
-                row.MouseEnter:Connect(function() tween(row, {BackgroundTransparency = 0.45}, 0.1) end)
-                row.MouseLeave:Connect(function() tween(row, {BackgroundTransparency = 0.6}, 0.15) end)
-                row.MouseButton1Click:Connect(function()
-                    if selectedCopyPlayers[plr] then
-                        selectedCopyPlayers[plr] = nil
-                        row.BackgroundColor3 = M3.SurfaceHighest
-                        row.TextColor3 = M3.OnSurface
-                        row.Text = baseText
-                    else
+                corner(10, row)
+                local rowStroke = stroke(M3.GlassLine, 1, row, 0.9)
+
+                local thumb = Instance.new("ImageLabel")
+                thumb.Name = "Headshot"
+                thumb.Size = UDim2.new(0, 30, 0, 30)
+                thumb.Position = UDim2.new(0, 7, 0.5, -15)
+                thumb.BackgroundColor3 = M3.SurfaceHighest
+                thumb.BorderSizePixel = 0
+                thumb.Image = "rbxthumb://type=AvatarHeadShot&id=" .. tostring(plr.UserId) .. "&w=150&h=150"
+                thumb.ZIndex = 104
+                thumb.Parent = row
+                corner(15, thumb)
+                stroke(M3.GlassLine, 1, thumb, 0.82)
+
+                local nameLabel = Instance.new("TextLabel")
+                nameLabel.Name = "Name"
+                nameLabel.Size = UDim2.new(1, -92, 0, 18)
+                nameLabel.Position = UDim2.new(0, 45, 0, 5)
+                nameLabel.BackgroundTransparency = 1
+                nameLabel.Text = plr.DisplayName
+                nameLabel.TextColor3 = M3.OnSurface
+                nameLabel.TextSize = 12
+                nameLabel.Font = Enum.Font.GothamMedium
+                nameLabel.TextXAlignment = Enum.TextXAlignment.Left
+                nameLabel.TextTruncate = Enum.TextTruncate.AtEnd
+                nameLabel.ZIndex = 104
+                nameLabel.Parent = row
+
+                local userLabel = Instance.new("TextLabel")
+                userLabel.Name = "Username"
+                userLabel.Size = UDim2.new(1, -92, 0, 14)
+                userLabel.Position = UDim2.new(0, 45, 0, 23)
+                userLabel.BackgroundTransparency = 1
+                userLabel.Text = "@" .. plr.Name
+                userLabel.TextColor3 = M3.OnSurfaceFaint
+                userLabel.TextSize = 10
+                userLabel.Font = Enum.Font.Gotham
+                userLabel.TextXAlignment = Enum.TextXAlignment.Left
+                userLabel.ZIndex = 104
+                userLabel.Parent = row
+
+                local check = Instance.new("TextLabel")
+                check.Name = "Check"
+                check.Size = UDim2.new(0, 20, 1, 0)
+                check.Position = UDim2.new(1, -28, 0, 0)
+                check.BackgroundTransparency = 1
+                check.Text = "✓"
+                check.TextColor3 = M3.OnPrimary
+                check.TextSize = 14
+                check.Font = Enum.Font.GothamBold
+                check.Visible = false
+                check.ZIndex = 104
+                check.Parent = row
+
+                local selected = false
+                local function applySelected(state)
+                    selected = state
+                    if state then
                         selectedCopyPlayers[plr] = true
-                        row.BackgroundColor3 = M3.Accent
-                        row.TextColor3 = M3.OnPrimary
-                        row.Text = "✓ " .. baseText
+                        tween(row, {BackgroundColor3 = M3.Accent, BackgroundTransparency = 0}, 0.12)
+                        tween(rowStroke, {Color = M3.Accent, Transparency = 0.3}, 0.12)
+                        tween(nameLabel, {TextColor3 = M3.OnPrimary}, 0.12)
+                        tween(userLabel, {TextColor3 = Color3.fromRGB(86, 90, 98)}, 0.12)
+                        check.Visible = true
+                    else
+                        selectedCopyPlayers[plr] = nil
+                        tween(row, {BackgroundColor3 = M3.SurfaceHigh, BackgroundTransparency = 0.4}, 0.15)
+                        tween(rowStroke, {Color = M3.GlassLine, Transparency = 0.9}, 0.15)
+                        tween(nameLabel, {TextColor3 = M3.OnSurface}, 0.15)
+                        tween(userLabel, {TextColor3 = M3.OnSurfaceFaint}, 0.15)
+                        check.Visible = false
                     end
                     updateCopySaveBtn()
+                end
+
+                row.MouseEnter:Connect(function()
+                    if selected then return end
+                    tween(row, {BackgroundTransparency = 0.22}, 0.1)
+                end)
+                row.MouseLeave:Connect(function()
+                    if selected then return end
+                    tween(row, {BackgroundTransparency = 0.4}, 0.15)
+                end)
+                row.MouseButton1Click:Connect(function()
+                    applySelected(not selected)
                 end)
             end
         end
@@ -4738,6 +4909,7 @@ local function makeGui()
         if modalMode == "rename" then
             modalTitle.Text = "Rename avatar"
             tabBar.Visible = false
+            modalGradientLine.Visible = false
             inputWrap.Position = UDim2.new(0, 20, 0, 52)
             inputWrap.Visible = true
             playerList.Visible = false
@@ -4749,6 +4921,7 @@ local function makeGui()
         else
             modalTitle.Text = "New avatar"
             tabBar.Visible = true
+            modalGradientLine.Visible = true
             inputWrap.Position = UDim2.new(0, 20, 0, 94)
             btnSaveModal.Text = "Save"
             modalBox.Size = UDim2.new(0, 300, 0, 286)
@@ -4820,8 +4993,8 @@ local function makeGui()
 
     local optionsMenu = Instance.new("Frame")
     optionsMenu.Name = "OptionsMenu"
-    optionsMenu.Size = UDim2.new(0, 140, 0, 82)
-    optionsMenu.BackgroundColor3 = M3.SurfaceHigh
+    optionsMenu.Size = UDim2.new(0, 148, 0, 84)
+    optionsMenu.BackgroundColor3 = M3.Surface
     optionsMenu.BackgroundTransparency = 0
     optionsMenu.BorderSizePixel = 0
     optionsMenu.Visible = false
@@ -4829,15 +5002,29 @@ local function makeGui()
     optionsMenu.Parent = mf
     optionsMenu.ClipsDescendants = true
     corner(12, optionsMenu)
-    stroke(M3.OutlineVariant, 1, optionsMenu, 0.4)
+    stroke(M3.GlassLine, 1, optionsMenu, 0.8)
+
+    local optionsGrad = Instance.new("UIGradient")
+    optionsGrad.Name = "MenuGrad"
+    optionsGrad.Rotation = 90
+    optionsGrad.Color = ColorSequence.new({
+        ColorSequenceKeypoint.new(0, Color3.fromRGB(66, 70, 78)),
+        ColorSequenceKeypoint.new(0.55, Color3.fromRGB(48, 51, 58)),
+        ColorSequenceKeypoint.new(1, Color3.fromRGB(36, 38, 44)),
+    })
+    optionsGrad.Transparency = NumberSequence.new({
+        NumberSequenceKeypoint.new(0, 0.02),
+        NumberSequenceKeypoint.new(1, 0.18),
+    })
+    optionsGrad.Parent = optionsMenu
 
     local optionsScale = Instance.new("UIScale")
     optionsScale.Name = "AnimScale"
     optionsScale.Parent = optionsMenu
 
     local optionsMenuPad = Instance.new("UIPadding")
-    optionsMenuPad.PaddingTop = UDim.new(0, 6)
-    optionsMenuPad.PaddingBottom = UDim.new(0, 6)
+    optionsMenuPad.PaddingTop = UDim.new(0, 7)
+    optionsMenuPad.PaddingBottom = UDim.new(0, 7)
     optionsMenuPad.PaddingLeft = UDim.new(0, 6)
     optionsMenuPad.PaddingRight = UDim.new(0, 6)
     optionsMenuPad.Parent = optionsMenu
@@ -4845,8 +5032,10 @@ local function makeGui()
     local optionsMenuBg = Instance.new("TextButton")
     optionsMenuBg.Name = "OptionsMenuBg"
     optionsMenuBg.Size = UDim2.new(1, 0, 1, 0)
-    optionsMenuBg.BackgroundTransparency = 1
+    optionsMenuBg.BackgroundColor3 = Color3.fromRGB(14, 16, 20)
+    optionsMenuBg.BackgroundTransparency = 0.82
     optionsMenuBg.Text = ""
+    optionsMenuBg.AutoButtonColor = false
     optionsMenuBg.ZIndex = 150
     optionsMenuBg.Visible = false
     optionsMenuBg.Parent = mf
@@ -4871,13 +5060,16 @@ local function makeGui()
         if instant then
             if optionsScaleTween then optionsScaleTween:Cancel() end
             optionsMenu.Visible = false
+            optionsMenu.BackgroundTransparency = 0
             optionsScale.Scale = 1
             return
         end
         animateOptionsScale(0.92, 0.12)
+        tween(optionsMenu, {BackgroundTransparency = 0.3}, 0.12)
         task.delay(0.13, function()
             if token == optionsMenuToken then
                 optionsMenu.Visible = false
+                optionsMenu.BackgroundTransparency = 0
                 optionsScale.Scale = 1
             end
         end)
@@ -4897,8 +5089,8 @@ local function makeGui()
         local btn = Instance.new("TextButton")
         btn.Name = "Opt_" .. text
         btn.Size = UDim2.new(1, 0, 0, 34)
-        btn.BackgroundColor3 = M3.Surface
-        btn.BackgroundTransparency = 0
+        btn.BackgroundColor3 = M3.SurfaceHighest
+        btn.BackgroundTransparency = 1
         btn.Text = text
         btn.TextColor3 = color
         btn.TextSize = 12
@@ -4909,13 +5101,20 @@ local function makeGui()
         btn.LayoutOrder = order
         btn.Parent = optionsMenu
         corner(8, btn)
+        local btnStroke = stroke(M3.GlassLine, 1, btn, 1)
 
         local btnPad = Instance.new("UIPadding")
-        btnPad.PaddingLeft = UDim.new(0, 10)
+        btnPad.PaddingLeft = UDim.new(0, 12)
         btnPad.Parent = btn
 
-        btn.MouseEnter:Connect(function() tween(btn, {BackgroundColor3 = M3.SurfaceHighest}, 0.1) end)
-        btn.MouseLeave:Connect(function() tween(btn, {BackgroundColor3 = M3.Surface}, 0.15) end)
+        btn.MouseEnter:Connect(function()
+            tween(btn, {BackgroundTransparency = 0.72}, 0.1)
+            tween(btnStroke, {Transparency = 0.88}, 0.1)
+        end)
+        btn.MouseLeave:Connect(function()
+            tween(btn, {BackgroundTransparency = 1}, 0.15)
+            tween(btnStroke, {Transparency = 1}, 0.15)
+        end)
         return btn
     end
 
@@ -4959,8 +5158,8 @@ local function makeGui()
 
     openOptionsMenu = function(name, anchorBtn)
         optionsMenuTarget = name
-        local menuHeight = 82
-        optionsMenu.Size = UDim2.new(0, 140, 0, menuHeight)
+        local menuHeight = 84
+        optionsMenu.Size = UDim2.new(0, 148, 0, menuHeight)
 
         local absPos = anchorBtn.AbsolutePosition
         local mfPos = mf.AbsolutePosition
@@ -4970,11 +5169,13 @@ local function makeGui()
         local anchorX = (absPos.X - mfPos.X) / scale
         local anchorY = (absPos.Y - mfPos.Y) / scale
         local anchorH = anchorBtn.AbsoluteSize.Y / scale
-        local x = math.clamp(anchorX, 8, localW - 148)
+        local x = math.clamp(anchorX, 8, localW - 156)
         local y = math.clamp(anchorY + anchorH + 4, 8, localH - menuHeight - 8)
         optionsMenu.Position = UDim2.new(0, x, 0, y)
         optionsMenuToken = optionsMenuToken + 1
         optionsMenu.Visible = true
+        optionsMenu.BackgroundTransparency = 0.28
+        tween(optionsMenu, {BackgroundTransparency = 0}, 0.16)
         optionsMenuBg.Visible = true
         optionsScale.Scale = 0.92
         animateOptionsScale(1, 0.18)
@@ -5092,9 +5293,15 @@ local function makeGui()
     loadingFooter.Size = UDim2.new(1, 0, 0, 18)
     loadingFooter.Position = UDim2.new(0.5, 0, 0.5, 42)
     loadingFooter.BackgroundTransparency = 1
-    loadingFooter.Text = "Update date: " .. UPDATE_DATE
+    local monthNames = {"January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"}
+    local todayText = UPDATE_DATE
+    local dateOk, dateTable = pcall(function() return os.date("*t") end)
+    if dateOk and type(dateTable) == "table" and tonumber(dateTable.month) then
+        todayText = monthNames[dateTable.month] .. " " .. dateTable.day .. ", " .. dateTable.year
+    end
+    loadingFooter.Text = "Update date: " .. UPDATE_DATE .. "  •  Today: " .. todayText
     loadingFooter.TextColor3 = M3.OnSurface
-    loadingFooter.TextSize = 12
+    loadingFooter.TextSize = 11
     loadingFooter.Font = Enum.Font.Gotham
     loadingFooter.ZIndex = 903
     loadingFooter.Parent = loading
