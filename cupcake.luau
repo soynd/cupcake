@@ -5293,13 +5293,7 @@ local function makeGui()
     loadingFooter.Size = UDim2.new(1, 0, 0, 18)
     loadingFooter.Position = UDim2.new(0.5, 0, 0.5, 42)
     loadingFooter.BackgroundTransparency = 1
-    local monthNames = {"January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"}
-    local todayText = UPDATE_DATE
-    local dateOk, dateTable = pcall(function() return os.date("*t") end)
-    if dateOk and type(dateTable) == "table" and tonumber(dateTable.month) then
-        todayText = monthNames[dateTable.month] .. " " .. dateTable.day .. ", " .. dateTable.year
-    end
-    loadingFooter.Text = "Update date: " .. UPDATE_DATE .. "  •  Today: " .. todayText
+    loadingFooter.Text = "Update date: " .. UPDATE_DATE
     loadingFooter.TextColor3 = M3.OnSurface
     loadingFooter.TextSize = 11
     loadingFooter.Font = Enum.Font.Gotham
