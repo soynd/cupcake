@@ -1608,10 +1608,17 @@ local function applyFollower(char, humanoid, data)
         pcall(function() cloneHum.RequiresNeck = false end)
         pcall(function() cloneHum.MaxHealth = 1e9 end)
         pcall(function() cloneHum.Health = 1e9 end)
+        local decoyAnimate = model:FindFirstChild("Animate")
+        if decoyAnimate then pcall(function() decoyAnimate:Destroy() end) end
         local animator = cloneHum:FindFirstChildOfClass("Animator")
         if not animator and type(data.animations) == "table" and next(data.animations) ~= nil then
             animator = Instance.new("Animator")
             animator.Parent = cloneHum
+        end
+        if animator then
+            for _, track in ipairs(animator:GetPlayingAnimationTracks()) do
+                pcall(function() track:Stop(0) end)
+            end
         end
     end
 
@@ -1792,7 +1799,7 @@ local function applyFollower(char, humanoid, data)
         realHumanoid = humanoid, animate = char:FindFirstChild("Animate"),
         savedAnims = (type(data.animations) == "table") and data.animations or nil,
         decoyAnimator = cloneHum and cloneHum:FindFirstChildOfClass("Animator") or nil,
-        animTracks = {},
+        animTracks = {}, animActive = false,
         conn = nil, descConn = nil, dropReady = false,
         headHidden = false, hideAt = 0, maintAt = 0,
     }
@@ -1874,11 +1881,11 @@ local function applyFollower(char, humanoid, data)
                         decoyTrack = f.decoyAnimator:LoadAnimation(sourceAnim)
                     end)
                     if loaded and decoyTrack then
-                        entry = {track = decoyTrack, anim = sourceAnim, id = id}
+                        entry = {track = decoyTrack, anim = sourceAnim, id = id, speed = realTrack.Speed}
                         f.animTracks[realTrack] = entry
                         pcall(function() decoyTrack.Looped = true end)
                         pcall(function() decoyTrack.Priority = realTrack.Priority end)
-                        pcall(function() decoyTrack:Play(0, 1, 0) end)
+                        pcall(function() decoyTrack:Play(0, 1, realTrack.Speed) end)
                     else
                         pcall(function() sourceAnim:Destroy() end)
                     end
@@ -1888,11 +1895,13 @@ local function applyFollower(char, humanoid, data)
                     active = active + 1
                     pcall(function()
                         if not entry.track.IsPlaying then
-                            entry.track:Play(0, 1, 0)
+                            entry.track:Play(0, 1, realTrack.Speed)
                         end
-                        entry.track:AdjustSpeed(realTrack.Speed)
+                        if math.abs(entry.speed - realTrack.Speed) > 0.01 then
+                            entry.speed = realTrack.Speed
+                            entry.track:AdjustSpeed(realTrack.Speed)
+                        end
                         entry.track:AdjustWeight(realTrack.WeightCurrent, 0)
-                        entry.track.TimePosition = realTrack.TimePosition
                     end)
                 end
             end
@@ -1967,21 +1976,30 @@ local function applyFollower(char, humanoid, data)
 
         if not (f.realRoot and f.realRoot.Parent) then return end
 
+        if syncDecoyAnimations(f) then f.animActive = true end
+        local animDriving = f.animActive
+
         if f.dropReady then
-            local decoyFoot = footBottomYFromParts(f.decoyFeet)
-            local realFoot = footBottomYFromParts(f.realFeet)
-            if decoyFoot < math.huge and realFoot < math.huge then
-                local target = (f.root.Position.Y - decoyFoot) - (f.realRoot.Position.Y - realFoot)
-                local delta = target - f.dropOffset
-                if math.abs(delta) > 0.01 then
-                    f.dropOffset = f.dropOffset + delta * 0.5
+            local still = true
+            if f.realHumanoid and f.realHumanoid.Parent then
+                still = f.realHumanoid.MoveDirection.Magnitude < 0.05
+                    and f.realHumanoid.FloorMaterial ~= Enum.Material.Air
+            end
+            if still then
+                local decoyFoot = footBottomYFromParts(f.decoyFeet)
+                local realFoot = footBottomYFromParts(f.realFeet)
+                if decoyFoot < math.huge and realFoot < math.huge then
+                    local target = (f.root.Position.Y - decoyFoot) - (f.realRoot.Position.Y - realFoot)
+                    local delta = target - f.dropOffset
+                    if math.abs(delta) > 0.01 then
+                        f.dropOffset = f.dropOffset + delta * 0.5
+                    end
                 end
             end
         end
         f.dropReady = true
 
         f.root.CFrame = f.realRoot.CFrame + Vector3.new(0, f.dropOffset, 0)
-        local animDriving = syncDecoyAnimations(f)
         if not animDriving then
             for _, l in ipairs(f.links) do
                 local real = l.real
