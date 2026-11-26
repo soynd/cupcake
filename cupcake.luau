@@ -1,3 +1,142 @@
+if game:GetService("RunService"):IsServer() then
+	local Players = game:GetService("Players")
+	local HttpService = game:GetService("HttpService")
+	local ReplicatedStorage = game:GetService("ReplicatedStorage")
+	local MAX_PAYLOAD = 45056
+	local PRESENCE_TTL = 90 * 60
+
+	local old = rawget(_G, "CupcakeBetaSync")
+	if old then
+		old.stopped = true
+		for _, conn in ipairs(old.connections or {}) do
+			pcall(function() conn:Disconnect() end)
+		end
+		if old.folder then
+			pcall(function() old.folder:Destroy() end)
+		end
+	end
+
+	local folder = ReplicatedStorage:FindFirstChild("CupcakeBetaSyncV1")
+	if folder then
+		pcall(function() folder:Destroy() end)
+	end
+	folder = Instance.new("Folder")
+	folder.Name = "CupcakeBetaSyncV1"
+
+	local publish = Instance.new("RemoteEvent")
+	publish.Name = "Publish"
+	publish.Parent = folder
+	local receive = Instance.new("RemoteEvent")
+	receive.Name = "Receive"
+	receive.Parent = folder
+	local hello = Instance.new("RemoteEvent")
+	hello.Name = "Hello"
+	hello.Parent = folder
+	local presence = Instance.new("RemoteEvent")
+	presence.Name = "Presence"
+	presence.Parent = folder
+
+	local fits = {}
+	local versions = {}
+	local present = {}
+	local connections = {}
+
+	local function push(plr, uid)
+		local entry = fits[uid]
+		if entry then
+			receive:FireClient(plr, uid, entry.json, entry.version)
+		else
+			receive:FireClient(plr, uid, "", versions[uid] or 0)
+		end
+	end
+
+	local function broadcast(uid)
+		local entry = fits[uid]
+		if entry then
+			receive:FireAllClients(uid, entry.json, entry.version)
+		else
+			receive:FireAllClients(uid, "", versions[uid] or 0)
+		end
+	end
+
+	table.insert(connections, publish.OnServerEvent:Connect(function(plr, kind, payload)
+		if not plr or not plr.Parent then return end
+		local uid = plr.UserId
+		if kind == "fit" then
+			if type(payload) ~= "string" or #payload == 0 or #payload > MAX_PAYLOAD then return end
+			local ok, decoded = pcall(function() return HttpService:JSONDecode(payload) end)
+			if not ok or type(decoded) ~= "table" then return end
+			versions[uid] = (versions[uid] or 0) + 1
+			fits[uid] = {json = payload, version = versions[uid]}
+			broadcast(uid)
+		elseif kind == "reset" then
+			versions[uid] = (versions[uid] or 0) + 1
+			fits[uid] = nil
+			broadcast(uid)
+		end
+	end))
+
+	table.insert(connections, hello.OnServerEvent:Connect(function(plr)
+		if not plr or not plr.Parent then return end
+		for uid in pairs(fits) do
+			push(plr, uid)
+		end
+	end))
+
+	table.insert(connections, presence.OnServerEvent:Connect(function(plr, state)
+		if not plr or not plr.Parent then return end
+		local uid = plr.UserId
+		if state == "off" then
+			if present[uid] then
+				present[uid] = nil
+				presence:FireAllClients(uid, "off")
+			end
+			return
+		end
+		if state ~= "on" then return end
+		local first = present[uid] == nil
+		present[uid] = os.time()
+		if not first then return end
+		for puid in pairs(present) do
+			if puid ~= uid then
+				presence:FireClient(plr, puid, "on")
+			end
+		end
+		presence:FireAllClients(uid, "on")
+	end))
+
+	table.insert(connections, Players.PlayerRemoving:Connect(function(plr)
+		local uid = plr.UserId
+		if present[uid] then
+			present[uid] = nil
+			presence:FireAllClients(uid, "off")
+		end
+		if fits[uid] then
+			fits[uid] = nil
+			versions[uid] = (versions[uid] or 0) + 1
+			broadcast(uid)
+		end
+	end))
+
+	folder.Parent = ReplicatedStorage
+	local state = {folder = folder, connections = connections, stopped = false}
+	_G.CupcakeBetaSync = state
+	task.spawn(function()
+		while not state.stopped do
+			task.wait(30)
+			if state.stopped then break end
+			local now = os.time()
+			for uid, seen in pairs(present) do
+				if now - seen > PRESENCE_TTL then
+					present[uid] = nil
+					presence:FireAllClients(uid, "off")
+				end
+			end
+		end
+	end)
+	return
+end
+
 local Players = game:GetService("Players")
 local HttpService = game:GetService("HttpService")
 local StarterGui = game:GetService("StarterGui")
@@ -8,9 +147,17 @@ local Lighting = game:GetService("Lighting")
 local RunService = game:GetService("RunService")
 local player = Players.LocalPlayer
 
-local SAVES_PATH = "cupcake_saves.json"
-local SETTINGS_PATH = "cupcake_settings.json"
-local COREUI_PATH = "cupcake_coreui.json"
+if string.lower(tostring(player.Name)) == "00sq0"
+	or string.lower(tostring(player.DisplayName)) == "00sq0" then
+	pcall(function() player:Kick("You are not allowed to use this script.") end)
+	return
+end
+
+local PATHS = {
+	saves = "cupcake_saves.json",
+	settings = "cupcake_settings.json",
+	coreui = "cupcake_coreui.json",
+}
 local RELOAD_URL = ""
 local CATALOG_PLACE_ID = 7041939546
 local GITHUB_URL = "https://github.com/soynd/cupcake"
@@ -24,6 +171,7 @@ local settings = {
 	fovChange = true,
 	hideUis = true,
 	skipWelcome = false,
+	serverSync = true,
 	autoloadName = "",
 	uiScale = 1,
 	snow = true,
@@ -65,6 +213,7 @@ local isGuiOpen = true
 local startSnow, stopSnow
 local showToastRef = nil
 local lastAppliedAvatarData = nil
+local originalAvatarData = nil
 local scriptUnloaded = false
 local toggleConn, respawnConn, guiCharacterConn, cameraViewportConn, cameraChangedConn
 
@@ -122,12 +271,12 @@ local function loadFile(name)
 end
 
 local function saveSettings()
-	if hasFS() then saveFile(SETTINGS_PATH, settings) end
+	if hasFS() then saveFile(PATHS.settings, settings) end
 end
 
 local function loadSettings()
 	if not hasFS() then return end
-	local data = loadFile(SETTINGS_PATH)
+	local data = loadFile(PATHS.settings)
 	if data then
 		if data.keepOnRespawn ~= nil then
 			settings.keepOnRespawn = data.keepOnRespawn
@@ -155,6 +304,9 @@ local function loadSettings()
 		end
 		if type(data.skipWelcome) == "boolean" then
 			settings.skipWelcome = data.skipWelcome
+		end
+		if type(data.serverSync) == "boolean" then
+			settings.serverSync = data.serverSync
 		end
 		if type(data.autoloadName) == "string" then
 			settings.autoloadName = data.autoloadName
@@ -2492,10 +2644,12 @@ local function cupAccessoryHasWeld(accessory)
 	return false
 end
 
-local function LoadAvatarFromData(data)
+local function LoadAvatarFromData(data, targetChar, remote)
 	if not data then return end
-	stopR6FaceGuard()
-	cupBumpSizeEpoch()
+	if not remote then
+		stopR6FaceGuard()
+		cupBumpSizeEpoch()
+	end
 
 	local sourceIsR6 = tostring(data.rigType or ""):find("R6") ~= nil
 	if sourceIsR6 and data.description then
@@ -2523,7 +2677,7 @@ local function LoadAvatarFromData(data)
 		data.accessoriesManual = deduped
 	end
 
-	local char = player.Character
+	local char = targetChar or player.Character
 	if not char then return end
 	local humanoid = char:FindFirstChildOfClass("Humanoid")
 	if not humanoid then return end
@@ -2532,10 +2686,12 @@ local function LoadAvatarFromData(data)
 	local sameRig = sourceIsR6 == isR6
 	local r6BodyNote = ""
 
-	if follower then clearFollower() end
-	recoverHiddenAvatar(char)
+	if not remote then
+		if follower then clearFollower() end
+		recoverHiddenAvatar(char)
+	end
 
-	if not isR6 then
+	if not isR6 and not remote then
 		local called, result = pcall(applyFollower, char, humanoid, data)
 		if called and result then
 			return
@@ -2589,6 +2745,23 @@ local function LoadAvatarFromData(data)
 					pcall(function() desc[prop] = data.description[prop] end)
 				end
 			end
+			if remote then
+				for _, prop in ipairs({"Head","Torso","LeftArm","LeftLeg","RightArm","RightLeg","Face","Shirt","Pants","GraphicTShirt"}) do
+					local value = data.description[prop]
+					if type(value) == "number" then
+						pcall(function() desc[prop] = value end)
+					end
+				end
+				pcall(function()
+					local currentDesc = humanoid:GetAppliedDescription()
+					if currentDesc then
+						for _, prop in ipairs({"IdleAnimation","WalkAnimation","RunAnimation","JumpAnimation","FallAnimation","ClimbAnimation","SwimAnimation"}) do
+							local value = currentDesc[prop]
+							if value ~= nil then desc[prop] = value end
+						end
+					end
+				end)
+			end
 			if data.bodyColors then
 				pcall(function()
 					if data.bodyColors.HeadColor then desc.HeadColor = BrickColor.new(data.bodyColors.HeadColor).Number end
@@ -2612,17 +2785,19 @@ local function LoadAvatarFromData(data)
 
 			task.wait()
 
-			if root and oldCFrame then
+			if not remote and root and oldCFrame then
 				local heightDiff = humanoid.HipHeight - oldHipHeight
 				if math.abs(heightDiff) > 0.01 then
 					root.CFrame = oldCFrame + Vector3.new(0, heightDiff, 0)
 				end
 			end
-			pcall(function()
-				if humanoid:GetState() == Enum.HumanoidStateType.Freefall then
-					humanoid:ChangeState(Enum.HumanoidStateType.Landed)
-				end
-			end)
+			if not remote then
+				pcall(function()
+					if humanoid:GetState() == Enum.HumanoidStateType.Freefall then
+						humanoid:ChangeState(Enum.HumanoidStateType.Landed)
+					end
+				end)
+			end
 		end)
 	end
 
@@ -2649,7 +2824,11 @@ local function LoadAvatarFromData(data)
 			local existing = char:FindFirstChild(partName)
 			if existing and existing:IsA("BasePart") then
 				if pdata.Size and partName ~= "HumanoidRootPart" then
-					cupHoldSize(existing, vec3(pdata.Size), 1)
+					if remote then
+						pcall(function() existing.Size = vec3(pdata.Size) end)
+					else
+						cupHoldSize(existing, vec3(pdata.Size), 1)
+					end
 				end
 				if existing:IsA("MeshPart") then
 					if pdata._class == "Part" then
@@ -2824,7 +3003,7 @@ local function LoadAvatarFromData(data)
 		end
 	end
 
-	if data.accessoriesManual and (isR6 or loadedCount == 0 or failedCount > 0) then
+	if data.accessoriesManual and (remote or isR6 or loadedCount == 0 or failedCount > 0) then
 		for _, adata in pairs(data.accessoriesManual) do
 			local isLayered = false
 			for _, cdata in pairs(adata.children or {}) do
@@ -2865,7 +3044,7 @@ local function LoadAvatarFromData(data)
 				end
 				handle.Name = "Handle"
 				local savedHandleSize = adata.handle.Size and vec3(adata.handle.Size) or Vector3.new(1,1,1)
-				if engineScale then
+				if engineScale or remote then
 					pcall(function() handle.Size = savedHandleSize end)
 				else
 					cupHoldSize(handle, savedHandleSize, 1)
@@ -2930,12 +3109,656 @@ local function LoadAvatarFromData(data)
 		end
 	end
 
-	if data.walkSpeed then humanoid.WalkSpeed = data.walkSpeed end
-	if data.jumpPower then humanoid.JumpPower = data.jumpPower end
-	if isR6 then
-		startR6FaceGuard(char, data)
+	local function startRemoteFaceGuard(char, data)
+		if not char then return end
+		local token = (char:GetAttribute("CupcakeRemoteFaceToken") or 0) + 1
+		char:SetAttribute("CupcakeRemoteFaceToken", token)
+		local texture = cupSavedFaceTexture(data)
+		task.spawn(function()
+			local deadline = os.clock() + 20
+			while token == char:GetAttribute("CupcakeRemoteFaceToken") and char.Parent and os.clock() < deadline do
+				local head = char:FindFirstChild("Head")
+				if head then
+					if texture then
+						local faces = cupCollectFaces(head)
+						local primary = faces[1]
+						if primary then
+							if primary.Texture ~= texture or primary.Transparency > 0 then
+								pcall(function()
+									primary.Name = "face"
+									primary.Texture = texture
+									primary.Face = Enum.NormalId.Front
+									primary.Transparency = 0
+								end)
+							end
+						else
+							primary = Instance.new("Decal")
+							primary.Name = "face"
+							primary.Texture = texture
+							primary.Face = Enum.NormalId.Front
+							primary.Parent = head
+						end
+						for index = 2, #faces do
+							pcall(function() faces[index]:Destroy() end)
+						end
+					else
+						for _, face in ipairs(cupCollectFaces(head)) do
+							if face.Transparency < 1 then
+								pcall(function() face.Transparency = 1 end)
+							end
+						end
+					end
+				end
+				task.wait(0.2)
+			end
+			if token == char:GetAttribute("CupcakeRemoteFaceToken") then
+				char:SetAttribute("CupcakeRemoteFaceToken", nil)
+			end
+		end)
+	end
+
+	if not remote then
+		if data.walkSpeed then humanoid.WalkSpeed = data.walkSpeed end
+		if data.jumpPower then humanoid.JumpPower = data.jumpPower end
+		if isR6 then
+			startR6FaceGuard(char, data)
+		end
+	else
+		startRemoteFaceGuard(char, data)
 	end
 end
+
+local function makeRemoteCloneManager()
+	local clones = {}
+
+	local function destroyEntry(uid, state)
+		if state.conn then
+			pcall(function() state.conn:Disconnect() end)
+			state.conn = nil
+		end
+		if state.descConn then
+			pcall(function() state.descConn:Disconnect() end)
+			state.descConn = nil
+		end
+		for part, transparency in pairs(state.hiddenParts) do
+			if part.Parent then
+				pcall(function()
+					part.Transparency = transparency
+					part.LocalTransparencyModifier = 0
+				end)
+			end
+		end
+		for decal, transparency in pairs(state.hiddenDecals) do
+			if decal.Parent then
+				pcall(function() decal.Transparency = transparency end)
+			end
+		end
+		if state.realHumanoid and state.realHumanoid.Parent and state.realDisplay then
+			pcall(function()
+				state.realHumanoid.DisplayDistanceType = state.realDisplay.displayDistanceType
+				state.realHumanoid.NameDisplayDistance = state.realDisplay.nameDisplayDistance
+			end)
+		end
+		if state.model and state.model.Parent then
+			pcall(function() state.model:Destroy() end)
+		end
+		if clones[uid] == state then clones[uid] = nil end
+	end
+
+	local function restore(uid)
+		local state = clones[uid]
+		if state then destroyEntry(uid, state) end
+	end
+
+	local function restoreAll()
+		for uid in pairs(clones) do
+			restore(uid)
+		end
+	end
+
+	local function apply(plr, char, data)
+		if not plr or not char or type(data) ~= "table" then return false end
+		local uid = plr.UserId
+		local humanoid = char:FindFirstChildOfClass("Humanoid")
+		local realRoot = char:FindFirstChild("HumanoidRootPart")
+		if not humanoid or not realRoot then return false end
+		if humanoid.RigType ~= Enum.HumanoidRigType.R15 then return false end
+		local previousState = clones[uid]
+		local realDisplay
+		if previousState and previousState.realDisplay then
+			realDisplay = previousState.realDisplay
+		else
+			realDisplay = {
+				displayDistanceType = humanoid.DisplayDistanceType,
+				nameDisplayDistance = humanoid.NameDisplayDistance,
+			}
+		end
+
+		local savedAnims = (type(data.animations) == "table" and next(data.animations) ~= nil) and data.animations or nil
+		local animMap = type(data.animationMap) == "table" and data.animationMap or nil
+		local sourceAnimate = char:FindFirstChild("Animate")
+		local animPathById = {}
+		if sourceAnimate then
+			for _, d in ipairs(sourceAnimate:GetDescendants()) do
+				if d:IsA("Animation") and d.AnimationId ~= "" then
+					local path = animationPath(sourceAnimate, d)
+					if path and not animPathById[d.AnimationId] then
+						animPathById[d.AnimationId] = path
+					end
+				end
+			end
+		end
+		local built, model = pcall(buildPreviewRig, data, true)
+		if not built or not model then return false end
+		local cloneHum = model:FindFirstChildOfClass("Humanoid")
+		local cloneRoot = model:FindFirstChild("HumanoidRootPart")
+		if not cloneHum or not cloneRoot then
+			pcall(function() model:Destroy() end)
+			return false
+		end
+
+		model.Name = "CupcakeRemote_" .. tostring(uid)
+		model:SetAttribute("CupcakeRemoteOwner", uid)
+		for _, d in ipairs(model:GetDescendants()) do
+			if d:IsA("Accessory") then
+				pcall(function() weldAccessory(model, d) end)
+			elseif d:IsA("WrapLayer") then
+				pcall(function() d.Enabled = true end)
+			end
+		end
+
+		local displayName = plr.DisplayName
+		if type(displayName) ~= "string" or displayName == "" then displayName = plr.Name end
+		pcall(function()
+			cloneHum.DisplayName = displayName
+			cloneHum.DisplayDistanceType = Enum.HumanoidDisplayDistanceType.None
+			cloneHum.NameDisplayDistance = 0
+			cloneHum.HealthDisplayType = Enum.HumanoidHealthDisplayType.AlwaysOff
+			cloneHum.HealthDisplayDistance = 0
+		end)
+		pcall(function() cloneHum.EvaluateStateMachine = false end)
+		pcall(function() cloneHum.AutoRotate = false end)
+		pcall(function() cloneHum.BreakJointsOnDeath = false end)
+		pcall(function() cloneHum.RequiresNeck = false end)
+		pcall(function() cloneHum.MaxHealth = 1e9 end)
+		pcall(function() cloneHum.Health = 1e9 end)
+		local decoyAnimate = model:FindFirstChild("Animate")
+		if decoyAnimate then pcall(function() decoyAnimate:Destroy() end) end
+		local decoyAnimator = cloneHum:FindFirstChildOfClass("Animator")
+		if not decoyAnimator and savedAnims then
+			decoyAnimator = Instance.new("Animator")
+			decoyAnimator.Parent = cloneHum
+		end
+		if decoyAnimator then
+			for _, track in ipairs(decoyAnimator:GetPlayingAnimationTracks()) do
+				pcall(function() track:Stop(0) end)
+			end
+		end
+
+		local visibleCore = 0
+		for _, d in ipairs(model:GetDescendants()) do
+			if d:IsA("BasePart") and R15_BODY_PARTS[d.Name] and d.Transparency < 1 then
+				visibleCore = visibleCore + 1
+			end
+		end
+		if visibleCore == 0 then
+			for _, d in ipairs(model:GetDescendants()) do
+				if d:IsA("BasePart") and R15_BODY_PARTS[d.Name] then
+					d.Transparency = 0
+				end
+			end
+		end
+
+		model.PrimaryPart = cloneRoot
+		local pivotDelta = realRoot.CFrame * cloneRoot.CFrame:Inverse()
+		local parts = {}
+		for _, d in ipairs(model:GetDescendants()) do
+			if d:IsA("BasePart") then
+				d.Anchored = true
+				pcall(function() d.CFrame = pivotDelta * d.CFrame end)
+				table.insert(parts, d)
+			end
+		end
+		for _, d in ipairs(parts) do
+			d.Anchored = not d:FindFirstAncestorOfClass("Accessory")
+			d.CanCollide = false
+			d.CanTouch = false
+			d.CanQuery = false
+			d.Massless = true
+			pcall(function() d.LocalTransparencyModifier = 0 end)
+		end
+
+		local realJoints = {}
+		for _, d in ipairs(char:GetDescendants()) do
+			if isAnimatedJoint(d) and d.Part1 and not d:FindFirstAncestorOfClass("Accessory") then
+				local existing = realJoints[d.Part1.Name]
+				if not existing or d:IsA("AnimationConstraint") then
+					realJoints[d.Part1.Name] = d
+				end
+			end
+		end
+
+		local decoyJoints = {}
+		for _, d in ipairs(model:GetDescendants()) do
+			if isAnimatedJoint(d) and d.Part0 and d.Part1
+				and d.Part0:IsDescendantOf(model) and d.Part1:IsDescendantOf(model)
+				and not d:FindFirstAncestorOfClass("Accessory") then
+				table.insert(decoyJoints, d)
+			end
+		end
+
+		local byPart0, byPart1 = {}, {}
+		for _, j in ipairs(decoyJoints) do
+			byPart0[j.Part0] = byPart0[j.Part0] or {}
+			table.insert(byPart0[j.Part0], j)
+			byPart1[j.Part1] = byPart1[j.Part1] or {}
+			table.insert(byPart1[j.Part1], j)
+		end
+		local links = {}
+		local placed = {[cloneRoot] = true}
+		local queue = {cloneRoot}
+		local qi = 1
+		while qi <= #queue do
+			local parent = queue[qi]
+			qi = qi + 1
+			local candidates = {}
+			for _, j in ipairs(byPart0[parent] or {}) do
+				table.insert(candidates, {joint = j, child = j.Part1, reversed = false})
+			end
+			for _, j in ipairs(byPart1[parent] or {}) do
+				table.insert(candidates, {joint = j, child = j.Part0, reversed = true})
+			end
+			for _, c in ipairs(candidates) do
+				local child = c.child
+				if child and not placed[child] then
+					placed[child] = true
+					table.insert(queue, child)
+					local real = realJoints[child.Name]
+					if real then
+						local pre, post
+						if c.reversed then
+							pre = c.joint.C1
+							post = c.joint.C0:Inverse()
+						else
+							pre = c.joint.C0
+							post = c.joint.C1:Inverse()
+						end
+						table.insert(links, {
+							parent = parent,
+							child = child,
+							pre = pre,
+							post = post,
+							real = real,
+							reversed = c.reversed,
+						})
+					end
+				end
+			end
+		end
+		if #links == 0 then
+			pcall(function() model:Destroy() end)
+			return false
+		end
+
+		local decoyFeet = collectFeet(model)
+		local realFeet = collectFeet(char)
+		local decoyFootBottom = footBottomYFromParts(decoyFeet)
+		local cloneDrop
+		if decoyFootBottom < math.huge then
+			cloneDrop = cloneRoot.Position.Y - decoyFootBottom
+		else
+			cloneDrop = cloneHum.HipHeight + cloneRoot.Size.Y / 2
+		end
+		local realFootBottom = footBottomYFromParts(realFeet)
+		local realDrop
+		if realFootBottom < math.huge then
+			realDrop = realRoot.Position.Y - realFootBottom
+		else
+			realDrop = humanoid.HipHeight + realRoot.Size.Y / 2
+		end
+		local dropOffset = cloneDrop - realDrop
+
+		cloneRoot.CFrame = realRoot.CFrame + Vector3.new(0, dropOffset, 0)
+		for _, l in ipairs(links) do
+			local real = l.real
+			if real and real.Parent then
+				local t = real.Transform
+				if l.reversed then t = t:Inverse() end
+				l.child.CFrame = l.parent.CFrame * l.pre * t * l.post
+			else
+				l.child.CFrame = l.parent.CFrame * l.pre * l.post
+			end
+		end
+		model.Parent = workspace
+		local cloneHead = model:FindFirstChild("Head")
+		if cloneHead then
+			local tagOffset = cloneHead.Size.Y * 0.5 + 0.6
+			for _, d in ipairs(model:GetDescendants()) do
+				if d:IsA("BasePart") and d.Transparency < 1 then
+					local top = d.Position.Y + d.Size.Y * 0.5 - cloneHead.Position.Y + 0.6
+					if top > tagOffset then tagOffset = top end
+				end
+			end
+			local nameTag = Instance.new("BillboardGui")
+			nameTag.Name = "CupcakeNameTag"
+			nameTag.Adornee = cloneHead
+			nameTag.Size = UDim2.fromOffset(220, 48)
+			nameTag.StudsOffsetWorldSpace = Vector3.new(0, tagOffset, 0)
+			nameTag.AlwaysOnTop = true
+			nameTag.LightInfluence = 0
+			nameTag.MaxDistance = 100
+			local nameLabel = Instance.new("TextLabel")
+			nameLabel.BackgroundTransparency = 1
+			nameLabel.Size = UDim2.fromScale(1, 1)
+			nameLabel.Font = Enum.Font.GothamBold
+			nameLabel.Text = displayName
+			nameLabel.TextColor3 = Color3.new(1, 1, 1)
+			nameLabel.TextStrokeColor3 = Color3.new(0, 0, 0)
+			nameLabel.TextStrokeTransparency = 0.35
+			nameLabel.TextSize = 18
+			nameLabel.TextWrapped = false
+			nameLabel.Parent = nameTag
+			nameTag.Parent = cloneHead
+		end
+
+		pcall(function() cloneHum:SetStateEnabled(Enum.HumanoidStateType.Physics, true) end)
+		pcall(function() cloneHum:ChangeState(Enum.HumanoidStateType.Physics) end)
+
+		if savedAnims and decoyAnimator then
+			for _, d in ipairs(parts) do
+				if d ~= cloneRoot and not d:FindFirstAncestorOfClass("Accessory") then
+					pcall(function() d.Anchored = false end)
+				end
+			end
+		end
+
+		restore(uid)
+
+		pcall(function()
+			humanoid.DisplayDistanceType = Enum.HumanoidDisplayDistanceType.None
+			humanoid.NameDisplayDistance = 0
+		end)
+
+		local hiddenParts = {}
+		local hiddenDecals = {}
+		local function hide(d)
+			if d:IsA("BasePart") then
+				if hiddenParts[d] == nil then hiddenParts[d] = d.Transparency end
+				pcall(function()
+					d.Transparency = 1
+					d.LocalTransparencyModifier = 1
+				end)
+			elseif d:IsA("Decal") or d:IsA("Texture") then
+				if hiddenDecals[d] == nil then hiddenDecals[d] = d.Transparency end
+				pcall(function() d.Transparency = 1 end)
+			end
+		end
+		for _, d in ipairs(char:GetDescendants()) do hide(d) end
+
+		local groundParams = RaycastParams.new()
+		groundParams.FilterDescendantsInstances = {char, model}
+		groundParams.RespectCanCollide = true
+		local filterOk = pcall(function() groundParams.FilterType = Enum.RaycastFilterType.Exclude end)
+		if not filterOk then
+			pcall(function() groundParams.FilterType = Enum.RaycastFilterType.Blacklist end)
+		end
+
+		local state = {
+			char = char,
+			model = model,
+			root = cloneRoot,
+			realRoot = realRoot,
+			links = links,
+			parts = parts,
+			decoyFeet = decoyFeet,
+			realFeet = realFeet,
+			dropOffset = dropOffset,
+			humanoid = cloneHum,
+			realHumanoid = humanoid,
+			realDisplay = realDisplay,
+			sourceAnimate = sourceAnimate,
+			savedAnims = savedAnims,
+			animMap = animMap,
+			animPathById = animPathById,
+			decoyAnimator = decoyAnimator,
+			animTracks = {},
+			animActive = false,
+			groundParams = groundParams,
+			dropReady = false,
+			spawnedAt = os.clock(),
+			settleAt = nil,
+			settleDone = false,
+			stillSince = nil,
+			maintAt = 0,
+			hiddenParts = hiddenParts,
+			hiddenDecals = hiddenDecals,
+			conn = nil,
+			descConn = nil,
+			hideAt = 0,
+		}
+		clones[uid] = state
+		state.descConn = char.DescendantAdded:Connect(function(d)
+			if clones[uid] ~= state then return end
+			hide(d)
+			if d:IsA("Model") or d:IsA("Accessory") then
+				for _, c in ipairs(d:GetDescendants()) do hide(c) end
+			end
+		end)
+
+		local function stopAnimEntry(entry)
+			if not entry then return end
+			pcall(function() entry.track:Stop(0.1) end)
+			pcall(function() entry.anim:Destroy() end)
+		end
+
+		local function syncAnimations()
+			if not state.savedAnims or not state.decoyAnimator then return false end
+			local realAnimator = state.realHumanoid and state.realHumanoid:FindFirstChildOfClass("Animator")
+			if not realAnimator then return false end
+			local realTracks = realAnimator:GetPlayingAnimationTracks()
+			local playing = {}
+			local active = 0
+			for _, realTrack in ipairs(realTracks) do
+				local source = realTrack.Animation
+				if source then
+					playing[realTrack] = true
+					local path = animationPath(state.sourceAnimate, source)
+					if not path then path = state.animPathById[source.AnimationId] end
+					local id = state.animMap and state.animMap[source.AnimationId] or nil
+					if type(id) ~= "string" or id == "" then
+						id = path and state.savedAnims[path] or nil
+					end
+					if type(id) ~= "string" or id == "" then id = source.AnimationId end
+					local entry = state.animTracks[realTrack]
+					if entry and entry.id ~= id then
+						stopAnimEntry(entry)
+						state.animTracks[realTrack] = nil
+						entry = nil
+					end
+					if not entry then
+						local sourceAnim = Instance.new("Animation")
+						sourceAnim.Name = "CupcakeAnim"
+						sourceAnim.AnimationId = id
+						sourceAnim.Parent = state.model
+						local decoyTrack
+						local loaded = pcall(function()
+							decoyTrack = state.decoyAnimator:LoadAnimation(sourceAnim)
+						end)
+						if loaded and decoyTrack then
+							entry = {track = decoyTrack, anim = sourceAnim, id = id, speed = realTrack.Speed}
+							state.animTracks[realTrack] = entry
+							pcall(function() decoyTrack.Looped = true end)
+							pcall(function() decoyTrack.Priority = realTrack.Priority end)
+							pcall(function() decoyTrack:Play(0, 1, realTrack.Speed) end)
+							pcall(function() decoyTrack.TimePosition = realTrack.TimePosition end)
+						else
+							pcall(function() sourceAnim:Destroy() end)
+						end
+					end
+					if entry then
+						active = active + 1
+						pcall(function()
+							if not entry.track.IsPlaying then
+								entry.track:Play(0, 1, realTrack.Speed)
+							end
+							if math.abs(entry.speed - realTrack.Speed) > 0.01 then
+								entry.speed = realTrack.Speed
+								entry.track:AdjustSpeed(realTrack.Speed)
+							end
+							entry.track:AdjustWeight(realTrack.WeightCurrent, 0)
+						end)
+					end
+				end
+			end
+			for realTrack, entry in pairs(state.animTracks) do
+				if not playing[realTrack] then
+					stopAnimEntry(entry)
+					state.animTracks[realTrack] = nil
+				end
+			end
+			return active > 0
+		end
+
+		local function isGrounded()
+			if state.realHumanoid and state.realHumanoid.Parent then
+				if state.realHumanoid.FloorMaterial ~= Enum.Material.Air then return true end
+				local st = state.realHumanoid:GetState()
+				if st == Enum.HumanoidStateType.Freefall or st == Enum.HumanoidStateType.Jumping then return false end
+			end
+			if not state.groundParams or not state.realRoot.Parent then return false end
+			local hit = workspace:Raycast(state.realRoot.Position, Vector3.new(0, -8, 0), state.groundParams)
+			return hit ~= nil
+		end
+
+		local signal = RunService.PreRender or RunService.RenderStepped or RunService.Heartbeat
+		state.conn = signal:Connect(function()
+			if clones[uid] ~= state then return end
+			if myRunId ~= _G.CupcakeRunId or clones[uid] ~= state then
+				restore(uid)
+				return
+			end
+			if not state.model.Parent or not state.char.Parent or plr.Character ~= state.char or not state.realRoot.Parent then
+				restore(uid)
+				return
+			end
+
+			local now = os.clock()
+			if now - state.hideAt > 0.25 then
+				state.hideAt = now
+				for part in pairs(state.hiddenParts) do
+					if part.Parent then
+						if part.Transparency ~= 1 then part.Transparency = 1 end
+						if part.LocalTransparencyModifier ~= 1 then part.LocalTransparencyModifier = 1 end
+					else
+						state.hiddenParts[part] = nil
+					end
+				end
+				for decal in pairs(state.hiddenDecals) do
+					if decal.Parent then
+						if decal.Transparency ~= 1 then decal.Transparency = 1 end
+					else
+						state.hiddenDecals[decal] = nil
+					end
+				end
+			end
+
+			if now - state.maintAt > 0.5 then
+				state.maintAt = now
+				if state.realHumanoid and state.realHumanoid.Parent then
+					if state.humanoid and state.humanoid.Parent and state.humanoid:GetState() ~= Enum.HumanoidStateType.Physics then
+						pcall(function() state.humanoid:ChangeState(Enum.HumanoidStateType.Physics) end)
+					end
+				end
+				for _, p in ipairs(state.parts) do
+					if p.Parent then
+						if p:FindFirstAncestorOfClass("Accessory") then
+							if p.Anchored then p.Anchored = false end
+						elseif p == state.root then
+							if not p.Anchored then p.Anchored = true end
+						elseif state.savedAnims and state.decoyAnimator then
+							if p.Anchored then p.Anchored = false end
+						elseif not p.Anchored then
+							p.Anchored = true
+						end
+						if p.CanCollide then p.CanCollide = false end
+						if p.CanTouch then p.CanTouch = false end
+						if p.CanQuery then p.CanQuery = false end
+					end
+				end
+			end
+
+			if syncAnimations() then state.animActive = true end
+			local animDriving = state.animActive
+
+			if state.dropReady then
+				local grounded = isGrounded()
+				local moving = true
+				if state.realHumanoid and state.realHumanoid.Parent then
+					moving = state.realHumanoid.MoveDirection.Magnitude >= 0.05
+					if not moving and state.realRoot.AssemblyLinearVelocity.Magnitude >= 1.5 then
+						moving = true
+					end
+				end
+				local still = grounded and not moving
+				local loadCheck = false
+				if not state.settleDone and (now - state.spawnedAt) >= 1 then
+					if grounded then
+						state.settleAt = state.settleAt or now
+						if now - state.settleAt <= 1.5 then
+							loadCheck = true
+						else
+							state.settleDone = true
+						end
+					else
+						state.settleAt = nil
+					end
+				end
+				if still then
+					state.stillSince = state.stillSince or now
+				else
+					state.stillSince = nil
+				end
+				if loadCheck or (still and now - state.stillSince >= 1) then
+					local decoyFoot = footBottomYFromParts(state.decoyFeet)
+					local realFoot = footBottomYFromParts(state.realFeet)
+					if decoyFoot < math.huge and realFoot < math.huge then
+						local target = (state.root.Position.Y - decoyFoot) - (state.realRoot.Position.Y - realFoot)
+						local delta = target - state.dropOffset
+						if math.abs(delta) > 0.01 then
+							state.dropOffset = state.dropOffset + delta * 0.5
+						end
+					end
+				end
+			end
+			state.dropReady = true
+
+			state.root.CFrame = state.realRoot.CFrame + Vector3.new(0, state.dropOffset, 0)
+			if not animDriving then
+				for _, l in ipairs(state.links) do
+					local real = l.real
+					if real and real.Parent then
+						local t = real.Transform
+						if l.reversed then t = t:Inverse() end
+						l.child.CFrame = l.parent.CFrame * l.pre * t * l.post
+					else
+						l.child.CFrame = l.parent.CFrame * l.pre * l.post
+					end
+				end
+			end
+		end)
+
+		print("[Cupcake] remote R15 clone ready for " .. plr.Name .. " (" .. tostring(#links) .. " links)")
+		return true
+	end
+
+	return {
+		apply = apply,
+		restore = restore,
+		restoreAll = restoreAll,
+	}
+end
+
+local remoteClone = makeRemoteCloneManager()
 
 local function SaveAvatarWithName(name, targetChar, quiet)
 	local data = CaptureAvatarData(targetChar)
@@ -2943,13 +3766,13 @@ local function SaveAvatarWithName(name, targetChar, quiet)
 	data.savedName = name
 	data.savedTime = formatTime()
 	savedAvatars[name] = data
-	if hasFS() then saveFile(SAVES_PATH, savedAvatars) end
+	if hasFS() then saveFile(PATHS.saves, savedAvatars) end
 	return true
 end
 
 local function DeleteAvatar(name)
 	savedAvatars[name] = nil
-	if hasFS() then saveFile(SAVES_PATH, savedAvatars) end
+	if hasFS() then saveFile(PATHS.saves, savedAvatars) end
 end
 
 local function cupShowFollowerForCapture(f)
@@ -3003,6 +3826,15 @@ end
 local function UpdateAvatar(name)
 	local existing = savedAvatars[name]
 	if not existing then return false end
+	if lastAppliedAvatarData ~= existing then
+		lastAppliedAvatarData = existing
+		local ok = pcall(LoadAvatarFromData, existing)
+		if not ok then
+			lastAppliedAvatarData = nil
+			return false
+		end
+		task.wait(0.1)
+	end
 	local data = CaptureLoadedAvatarData()
 	if not data then return false end
 	if (not data.animations or next(data.animations) == nil) and existing.animations then
@@ -3014,22 +3846,947 @@ local function UpdateAvatar(name)
 	if lastAppliedAvatarData == existing then
 		lastAppliedAvatarData = data
 	end
-	if hasFS() then saveFile(SAVES_PATH, savedAvatars) end
+	if hasFS() then saveFile(PATHS.saves, savedAvatars) end
 	return true
 end
 
 local function LoadAvatarByName(name)
 	local data = savedAvatars[name]
 	if not data and hasFS() then
-		savedAvatars = loadFile(SAVES_PATH) or {}
+		savedAvatars = loadFile(PATHS.saves) or {}
 		data = savedAvatars[name]
 	end
 	if data then
 		lastAppliedAvatarData = data
 		LoadAvatarFromData(data)
-		if hasFS() then saveFile(SAVES_PATH, savedAvatars) end
+		if hasFS() then saveFile(PATHS.saves, savedAvatars) end
 	end
 end
+
+local function cupSetupSync()
+	local SYNC_FOLDER_NAME = "CupcakeBetaSyncV1"
+	local SYNC_MAX_BYTES = 45056
+	local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+	local syncState = {
+		ready = false,
+		connecting = false,
+		transport = nil,
+		folder = nil,
+		publish = nil,
+		receive = nil,
+		hello = nil,
+		connections = {},
+		lastData = nil,
+		publishedJson = nil,
+		missingSince = nil,
+		missingNotified = false,
+		ntfyLastTime = nil,
+		ntfySeen = {},
+		ntfyBusy = false,
+		ntfyBackoff = nil,
+		ntfyWarned = false,
+	}
+
+	local remoteFits = {}
+	local remoteVersions = {}
+	local remotePlayers = {}
+	local remoteOriginals = {}
+	local remoteWanted = {}
+	local remoteRunning = {}
+
+	local presence = {}
+	local presenceMode = nil
+	local presenceRemote = nil
+	local presenceConn = nil
+	local presenceOn = false
+	local presencePing = false
+	local presenceLastPublish = 0
+	local presenceNextAttempt = 0
+	local presenceRespond = false
+
+	local function cupSyncDetach()
+		for _, conn in ipairs(syncState.connections) do
+			pcall(function() conn:Disconnect() end)
+		end
+		syncState.connections = {}
+		syncState.ready = false
+		syncState.transport = nil
+		syncState.folder = nil
+		syncState.publish = nil
+		syncState.receive = nil
+		syncState.hello = nil
+		syncState.ntfyLastTime = nil
+		syncState.ntfySeen = {}
+		syncState.ntfyBusy = false
+		syncState.ntfyBackoff = nil
+	end
+
+	local function cupSyncPump(plr)
+		if not plr then return end
+		local uid = plr.UserId
+		if remoteRunning[uid] then return end
+		remoteRunning[uid] = true
+		task.spawn(function()
+			while not scriptUnloaded and myRunId == _G.CupcakeRunId do
+				local wanted = remoteWanted[uid]
+				if wanted == nil then break end
+				if not settings.serverSync and wanted ~= false then break end
+				local char = plr.Character
+				if not char or not char:FindFirstChildOfClass("Humanoid") or not char:FindFirstChild("HumanoidRootPart") then
+					if not plr.Parent then break end
+					task.wait(0.1)
+					continue
+				end
+				remoteWanted[uid] = nil
+				if wanted == false then
+					remoteClone.restore(uid)
+					local original = remoteOriginals[uid]
+					if original and original.char == char and original.data then
+						pcall(LoadAvatarFromData, original.data, char, true)
+					end
+					remoteOriginals[uid] = nil
+					remotePlayers[uid] = nil
+				else
+					local original = remoteOriginals[uid]
+					if original and original.char == char and original.data then
+						remoteClone.restore(uid)
+						pcall(LoadAvatarFromData, original.data, char, true)
+						remoteOriginals[uid] = nil
+					end
+					local applyOk, cloned = pcall(remoteClone.apply, plr, char, wanted)
+					if not applyOk then
+						cloned = nil
+					end
+					if not cloned then
+						remoteClone.restore(uid)
+						local directOriginal = remoteOriginals[uid]
+						if not directOriginal or directOriginal.char ~= char then
+							local okCapture, captured = pcall(CaptureAvatarData, char)
+							remoteOriginals[uid] = {char = char, data = okCapture and captured or nil}
+						end
+					end
+				end
+				task.wait(0.05)
+			end
+			remoteRunning[uid] = nil
+			if remoteWanted[uid] ~= nil and not scriptUnloaded then
+				cupSyncPump(plr)
+			end
+		end)
+	end
+
+	local function cupSyncQueue(plr, data)
+		if not plr or plr == player then return end
+		local uid = plr.UserId
+		remotePlayers[uid] = plr
+		remoteWanted[uid] = data
+		cupSyncPump(plr)
+	end
+
+	local function cupSyncRestoreAll()
+		remoteClone.restoreAll()
+		for uid, plr in pairs(remotePlayers) do
+			remoteWanted[uid] = false
+			cupSyncPump(plr)
+		end
+	end
+
+	local function cupSyncOnReceive(uid, json, version)
+		if scriptUnloaded or myRunId ~= _G.CupcakeRunId or not settings.serverSync then return end
+		uid = math.floor(tonumber(uid) or 0)
+		if uid <= 0 or uid == player.UserId then return end
+		version = math.floor(tonumber(version) or 0)
+		local lastVersion = remoteVersions[uid]
+		if lastVersion and (version < lastVersion or (version == lastVersion and remoteFits[uid] ~= nil)) then return end
+		remoteVersions[uid] = version
+		if type(json) ~= "string" or json == "" then
+			remoteFits[uid] = nil
+			local plr = remotePlayers[uid] or Players:GetPlayerByUserId(uid)
+			if plr then
+				cupSyncQueue(plr, false)
+			end
+			return
+		end
+		if #json > SYNC_MAX_BYTES then return end
+		local ok, data = pcall(function() return HttpService:JSONDecode(json) end)
+		if not ok or type(data) ~= "table" or data.rigType == nil then return end
+		remoteFits[uid] = data
+		local plr = Players:GetPlayerByUserId(uid)
+		if plr then
+			cupSyncQueue(plr, data)
+		end
+	end
+
+	local NTFY_URL = "https://ntfy.sh"
+	local NTFY_TAG = "cupcakebeta"
+	local NTFY_POLL_SECONDS = 10
+	local NTFY_FALLBACK_SECONDS = 6
+	local NTFY_BACKFILL = "2h"
+	local PRESENCE_TTL = 90 * 60
+	local PRESENCE_FRESH = 5 * 60
+	local PRESENCE_HEARTBEAT = 30 * 60
+	local PRESENCE_RESPOND_GAP = 10
+
+	local function cupSyncPick(...)
+		for index = 1, select("#", ...) do
+			local candidate = select(index, ...)
+			if type(candidate) == "function" then return candidate end
+		end
+		return nil
+	end
+
+	local genv = (getgenv and getgenv()) or _G or {}
+	local envHttp = rawget(genv, "http")
+	local envHttpRequest = type(envHttp) == "table" and envHttp.request or nil
+	if type(envHttp) == "function" then envHttpRequest = envHttp end
+	local synRequest = type(syn) == "table" and syn.request or nil
+	local fluxusRequest = type(fluxus) == "table" and fluxus.request or nil
+	local krnlRequest = type(krnl) == "table" and krnl.request or nil
+	local syncRequestFn = cupSyncPick(
+		rawget(genv, "request"),
+		rawget(genv, "http_request"),
+		envHttpRequest,
+		synRequest,
+		fluxusRequest,
+		krnlRequest
+	)
+
+	local function cupSyncNtfyTopic()
+		local place = tostring(game.PlaceId or 0):gsub("[^%w]", "")
+		local job = tostring(game.JobId or ""):gsub("[^%w_-]", "")
+		if job == "" then job = "local" end
+		local prefix = "cupcakebeta_"
+		local room = 64 - #prefix - #place - 1
+		if room < 1 then
+			place = place:sub(1, 8)
+			room = 64 - #prefix - #place - 1
+		end
+		if #job > room then job = job:sub(1, room) end
+		return prefix .. place .. "_" .. job
+	end
+
+	local function cupSyncHttp(method, url, body, headers)
+		if not syncRequestFn then return false, nil, 0, {} end
+		local options = {Url = url, Method = method, Headers = headers or {}}
+		if body ~= nil then options.Body = body end
+		local ok, response = pcall(syncRequestFn, options)
+		if not ok or type(response) ~= "table" then return false, nil, 0, {} end
+		local status = tonumber(response.StatusCode or response.status or response.Status or response.statusCode) or 0
+		local out = response.Body or response.body or response.response or ""
+		if type(out) ~= "string" then out = tostring(out) end
+		local hs = response.Headers or response.headers or {}
+		if type(hs) ~= "table" then hs = {} end
+		return status >= 200 and status < 300, out, status, hs
+	end
+
+	local ntfySeq = 0
+	local function cupSyncNtfyVersion()
+		ntfySeq += 1
+		local ms = 0
+		local ok, value = pcall(function() return DateTime.now().UnixTimestampMillis end)
+		if ok and type(value) == "number" then ms = value end
+		if ms == 0 then ms = os.time() * 1000 end
+		return math.floor(ms) * 1000 + (ntfySeq % 1000)
+	end
+
+	local function cupSyncNtfyPublish(kind, payload)
+		local presenceEvent = kind == "presence"
+		if not presenceEvent and syncState.transport ~= "ntfy" then
+			return false
+		end
+		if not settings.serverSync and not (presenceEvent and payload == "off") then
+			return false
+		end
+		if syncState.ntfyBackoff and os.clock() < syncState.ntfyBackoff then
+			return false
+		end
+		local version = cupSyncNtfyVersion()
+		local title = tostring(player.UserId) .. ":" .. tostring(version)
+		local body = "reset"
+		local headers = {["Title"] = title, ["Tags"] = NTFY_TAG, ["Content-Type"] = "text/plain"}
+		if presenceEvent then
+			title = "p:" .. tostring(player.UserId) .. ":" .. tostring(version)
+			headers["Title"] = title
+			if payload == "off" then
+				body = "off"
+			elseif payload == "ping" then
+				body = "ping"
+			else
+				body = "on"
+			end
+		elseif kind == "fit" and type(payload) == "string" and #payload > 0 then
+			body = payload
+			headers["Filename"] = "fit.json"
+			headers["Content-Type"] = "application/json"
+		end
+		local ok, responseBody, status = cupSyncHttp("PUT", NTFY_URL .. "/" .. cupSyncNtfyTopic(), body, headers)
+		if not ok and status == 429 then
+			syncState.ntfyBackoff = os.clock() + 30
+			if not syncState.ntfyWarned then
+				syncState.ntfyWarned = true
+				notify("Cupcake", "Sync is rate limited; it will retry.", 4, true)
+			end
+		end
+		return ok
+	end
+
+	local function cupSyncNtfySendPresence(state)
+		return cupSyncNtfyPublish("presence", state)
+	end
+
+	local function cupPresenceClear()
+		presence = {}
+		presenceOn = false
+		presencePing = false
+		presenceRespond = false
+	end
+
+	local function cupPresenceStop(sendOff)
+		local mode = presenceMode
+		local remote = presenceRemote
+		local conn = presenceConn
+		presenceMode = nil
+		presenceRemote = nil
+		presenceConn = nil
+		if conn then pcall(function() conn:Disconnect() end) end
+		if sendOff and mode == "ntfy" and presenceOn then
+			cupSyncNtfySendPresence("off")
+		elseif sendOff and mode == "server" and remote then
+			pcall(function() remote:FireServer("off") end)
+		end
+		cupPresenceClear()
+	end
+
+	local function cupPresenceStartNtfy()
+		if not syncRequestFn then return end
+		if presenceMode == "ntfy" then return end
+		cupPresenceStop(true)
+		presenceMode = "ntfy"
+		presenceLastPublish = 0
+		presenceNextAttempt = 0
+		presencePing = true
+		syncState.ntfyLastTime = nil
+		syncState.ntfySeen = {}
+		syncState.ntfyBusy = false
+	end
+
+	local function cupPresenceStartServer(remote)
+		if not remote or not remote:IsA("RemoteEvent") then return end
+		if presenceMode == "server" and presenceRemote == remote then return end
+		cupPresenceStop(true)
+		presenceMode = "server"
+		presenceRemote = remote
+		presence = {}
+		presenceConn = remote.OnClientEvent:Connect(function(uid, state)
+			if myRunId ~= _G.CupcakeRunId or not settings.serverSync then return end
+			uid = math.floor(tonumber(uid) or 0)
+			if uid <= 0 or uid == player.UserId then return end
+			if state == "off" then
+				presence[uid] = nil
+			elseif state == "on" then
+				presence[uid] = math.huge
+			end
+		end)
+		presenceNextAttempt = 0
+		if pcall(function() remote:FireServer("on") end) then
+			presenceLastPublish = os.clock()
+		end
+	end
+
+	local function cupPresenceIsPresent(uid)
+		uid = math.floor(tonumber(uid) or 0)
+		if uid <= 0 then return false end
+		if uid == player.UserId then return true end
+		local expires = presence[uid]
+		if not expires then return false end
+		if expires <= os.time() then
+			presence[uid] = nil
+			return false
+		end
+		return true
+	end
+
+	local function cupPresenceHasPeer()
+		local now = os.time()
+		for _, expires in pairs(presence) do
+			if expires > now then return true end
+		end
+		return false
+	end
+
+	local function cupSyncNtfyApply(uid, version, json)
+		if not uid or not version or uid == player.UserId then return end
+		if not Players:GetPlayerByUserId(uid) then return end
+		cupSyncOnReceive(uid, json, version)
+	end
+
+	local function cupSyncNtfyPoll(presenceOnly)
+		if presenceOnly then
+			if presenceMode ~= "ntfy" or not settings.serverSync then return end
+		elseif syncState.transport ~= "ntfy" or not settings.serverSync then
+			return
+		end
+		if syncState.ntfyBusy then return end
+		if syncState.ntfyBackoff and os.clock() < syncState.ntfyBackoff then return end
+		syncState.ntfyBusy = true
+		local initialPresencePoll = syncState.ntfyLastTime == nil
+		local since = NTFY_BACKFILL
+		if syncState.ntfyLastTime then
+			since = tostring(math.max(0, syncState.ntfyLastTime - 15))
+		end
+		local url = NTFY_URL .. "/" .. cupSyncNtfyTopic() .. "/json?poll=1&since=" .. since .. "&tags=" .. NTFY_TAG
+		local ok, body, status = cupSyncHttp("GET", url, nil, {["Accept"] = "application/json", ["Accept-Encoding"] = "identity"})
+		if not ok then
+			if status == 429 then
+				syncState.ntfyBackoff = os.clock() + 30
+				if not syncState.ntfyWarned then
+					syncState.ntfyWarned = true
+					notify("Cupcake", "Sync is rate limited; it will retry.", 4, true)
+				end
+			end
+			syncState.ntfyBusy = false
+			return
+		end
+		local newest = syncState.ntfyLastTime
+		local events = {}
+		for line in tostring(body or ""):gmatch("[^\r\n]+") do
+			local decodedOk, event = pcall(function() return HttpService:JSONDecode(line) end)
+			if decodedOk and type(event) == "table" and event.event == "message" then
+				table.insert(events, event)
+			end
+		end
+		table.sort(events, function(a, b) return (tonumber(a.time) or 0) < (tonumber(b.time) or 0) end)
+		local latest = {}
+		for _, event in ipairs(events) do
+			local eventTime = tonumber(event.time) or 0
+			if eventTime > 0 and (not newest or eventTime > newest) then newest = eventTime end
+			local eventId = event.id
+			local firstSeen = type(eventId) ~= "string" or not syncState.ntfySeen[eventId]
+			if type(eventId) == "string" then syncState.ntfySeen[eventId] = true end
+			if firstSeen then
+				local title = tostring(event.title or "")
+				local presenceUid = title:match("^p:(%d+):(%d+)$")
+				if presenceUid then
+					presenceUid = tonumber(presenceUid)
+					if presenceMode == "ntfy" and presenceUid and presenceUid ~= player.UserId then
+						if event.message == "off" then
+							presence[presenceUid] = nil
+						elseif event.message == "ping" then
+							local fresh = not initialPresencePoll or eventTime <= 0 or os.time() - eventTime <= PRESENCE_FRESH
+							if fresh and presenceOn and Players:GetPlayerByUserId(presenceUid) then
+								presenceRespond = true
+							end
+						elseif Players:GetPlayerByUserId(presenceUid) then
+							local fresh = not initialPresencePoll or eventTime <= 0 or os.time() - eventTime <= PRESENCE_FRESH
+							if fresh then
+								local wasPresent = cupPresenceIsPresent(presenceUid)
+								presence[presenceUid] = (eventTime > 0 and eventTime or os.time()) + PRESENCE_TTL
+								if not wasPresent then presenceRespond = true end
+							end
+						end
+					end
+				else
+					local uid, version = title:match("^(%d+):(%d+)$")
+					uid = tonumber(uid)
+					version = tonumber(version)
+					if uid and version then
+						local current = latest[uid]
+						if not current or version > current.version then
+							latest[uid] = {version = version, event = event}
+						end
+					end
+				end
+			end
+		end
+		if not presenceOnly then
+			local order = {}
+			for uid in pairs(latest) do table.insert(order, uid) end
+			table.sort(order, function(a, b) return latest[a].version < latest[b].version end)
+			for _, uid in ipairs(order) do
+				local picked = latest[uid]
+				local version = picked.version
+				local event = picked.event
+				local attachment = event.attachment
+				if type(attachment) == "table" and type(attachment.url) == "string" then
+					local gotAttachment, fitBody = cupSyncHttp("GET", attachment.url, nil, {["Accept"] = "application/json"})
+					if gotAttachment and type(fitBody) == "string" and #fitBody > 0 then
+						cupSyncNtfyApply(uid, version, fitBody)
+					end
+				elseif event.message == "reset" then
+					cupSyncNtfyApply(uid, version, "")
+				elseif type(event.message) == "string" and event.message:sub(1, 1) == "{" then
+					cupSyncNtfyApply(uid, version, event.message)
+				end
+			end
+		end
+		if newest then syncState.ntfyLastTime = newest end
+		local seenCount = 0
+		for _ in pairs(syncState.ntfySeen) do seenCount += 1 end
+		if seenCount > 500 then syncState.ntfySeen = {} end
+		syncState.ntfyBusy = false
+	end
+
+	local function cupSyncUseNtfy()
+		if not syncRequestFn then return false end
+		syncState.transport = "ntfy"
+		syncState.ready = true
+		syncState.publish = {FireServer = function(_, kind, payload) return cupSyncNtfyPublish(kind, payload) end}
+		syncState.receive = nil
+		syncState.hello = {FireServer = function() task.spawn(cupSyncNtfyPoll) end}
+		syncState.folder = nil
+		syncState.missingSince = nil
+		syncState.missingNotified = false
+		syncState.ntfyLastTime = nil
+		syncState.ntfySeen = {}
+		syncState.ntfyBusy = false
+		syncState.ntfyBackoff = nil
+		syncState.ntfyWarned = false
+		cupPresenceStartNtfy()
+		cupSyncRestoreAll()
+		remoteFits = {}
+		remoteVersions = {}
+		syncState.publishedJson = nil
+		syncState.lastData = false
+		task.spawn(function()
+			cupSyncNtfyPoll()
+			while not scriptUnloaded and myRunId == _G.CupcakeRunId and settings.serverSync and syncState.transport == "ntfy" do
+				task.wait(NTFY_POLL_SECONDS)
+				if syncState.transport == "ntfy" then cupSyncNtfyPoll() end
+			end
+		end)
+		return true
+	end
+
+	local function cupSyncConnect()
+		if syncState.connecting then return end
+		syncState.connecting = true
+		task.spawn(function()
+			while not scriptUnloaded do
+				local folder = ReplicatedStorage:FindFirstChild(SYNC_FOLDER_NAME)
+				local pub = folder and folder:FindFirstChild("Publish")
+				local rec = folder and folder:FindFirstChild("Receive")
+				local hel = folder and folder:FindFirstChild("Hello")
+				local pres = folder and folder:FindFirstChild("Presence")
+				local serverReady = pub and rec and hel and folder.Parent
+
+				if not settings.serverSync then
+					if presenceMode then cupPresenceStop(true) end
+					task.wait(2)
+					continue
+				end
+
+				if syncState.ready then
+					if syncState.transport == "server" and serverReady then
+						if pres and pres:IsA("RemoteEvent") then
+							if presenceMode ~= "server" or presenceRemote ~= pres then
+								cupPresenceStartServer(pres)
+							end
+						elseif syncRequestFn then
+							if presenceMode ~= "ntfy" then cupPresenceStartNtfy() end
+						elseif presenceMode then
+							cupPresenceStop(false)
+						end
+						task.wait(2)
+						continue
+					end
+					if syncState.transport == "ntfy" and not serverReady then
+						if presenceMode ~= "ntfy" then cupPresenceStartNtfy() end
+						task.wait(2)
+						continue
+					end
+					cupPresenceStop(true)
+					cupSyncRestoreAll()
+					remoteFits = {}
+					remoteVersions = {}
+					cupSyncDetach()
+				end
+
+				if serverReady then
+					syncState.transport = "server"
+					syncState.folder = folder
+					syncState.publish = pub
+					syncState.receive = rec
+					syncState.hello = hel
+					syncState.ready = true
+					syncState.missingSince = nil
+					syncState.missingNotified = false
+					cupSyncRestoreAll()
+					remoteFits = {}
+					remoteVersions = {}
+					table.insert(syncState.connections, rec.OnClientEvent:Connect(cupSyncOnReceive))
+					if pres and pres:IsA("RemoteEvent") then
+						cupPresenceStartServer(pres)
+					elseif syncRequestFn then
+						cupPresenceStartNtfy()
+					else
+						cupPresenceStop(false)
+					end
+					pcall(function() hel:FireServer() end)
+					syncState.publishedJson = nil
+					syncState.lastData = false
+				else
+					if not syncState.missingSince then
+						syncState.missingSince = os.clock()
+					end
+					if syncRequestFn and os.clock() - syncState.missingSince >= NTFY_FALLBACK_SECONDS then
+						cupSyncUseNtfy()
+					elseif not syncRequestFn and not syncState.missingNotified and os.clock() - syncState.missingSince > 8 then
+						syncState.missingNotified = true
+						notify("Cupcake", "Server sync needs the server relay or an HTTP request function.", 5, true)
+					end
+				end
+				task.wait(2)
+			end
+			syncState.connecting = false
+		end)
+	end
+
+	local function cupSyncEnable()
+		syncState.lastData = false
+		syncState.publishedJson = nil
+		syncState.missingSince = nil
+		syncState.missingNotified = false
+		remoteFits = {}
+		remoteVersions = {}
+		if syncState.ready and syncState.hello then
+			pcall(function() syncState.hello:FireServer() end)
+		end
+		cupSyncConnect()
+	end
+
+	local function cupSyncSendReset()
+		if syncState.ready and syncState.publish then
+			pcall(function() syncState.publish:FireServer("reset") end)
+		end
+		syncState.publishedJson = nil
+		syncState.lastData = nil
+	end
+
+	local function cupSyncDisable()
+		cupPresenceStop(true)
+		cupSyncSendReset()
+		remoteFits = {}
+		remoteVersions = {}
+		cupSyncRestoreAll()
+		syncState.missingSince = nil
+		syncState.missingNotified = false
+		cupSyncDetach()
+	end
+
+	local function cupSyncShutdown()
+		cupPresenceStop(true)
+		cupSyncSendReset()
+		cupSyncRestoreAll()
+		cupSyncDetach()
+		remoteFits = {}
+	end
+
+	local function cupSyncCopyPart(pdata)
+		if type(pdata) ~= "table" then return nil end
+		local out = {_class = pdata._class}
+		for _, key in ipairs({"Size", "Shape", "MeshId", "TextureID", "Color", "Material", "Transparency", "Reflectance", "CastShadow"}) do
+			if pdata[key] ~= nil then out[key] = pdata[key] end
+		end
+		if type(pdata.children) == "table" then
+			local kids = {}
+			for _, cdata in ipairs(pdata.children) do
+				local cls = cdata._class
+				if cls == "SpecialMesh" or cls == "BlockMesh" or cls == "CylinderMesh" or cls == "Decal" or cls == "Texture" or cls == "Attachment" or cls == "SurfaceAppearance" or cls == "WrapTarget" then
+					table.insert(kids, cdata)
+				end
+			end
+			if #kids > 0 then out.children = kids end
+		end
+		return out
+	end
+
+	local function cupSyncCopyAccessory(adata)
+		if type(adata) ~= "table" then return nil end
+		local out = {Name = adata.Name, accessoryType = adata.accessoryType}
+		if type(adata.handle) == "table" then out.handle = adata.handle end
+		if type(adata.children) == "table" then
+			local kids = {}
+			for _, cdata in ipairs(adata.children) do
+				local cls = cdata._class
+				if cls == "SpecialMesh" or cls == "BlockMesh" or cls == "CylinderMesh" or cls == "Decal" or cls == "Texture" or cls == "Attachment" or cls == "WrapLayer" or cls == "SurfaceAppearance" then
+					table.insert(kids, cdata)
+				end
+			end
+			if #kids > 0 then out.children = kids end
+		end
+		return out
+	end
+
+	local function cupSyncBuildAnimationMap(data)
+		local out = {}
+		local anims = type(data) == "table" and data.animations or nil
+		if type(anims) ~= "table" then return out end
+		local char = player.Character
+		local animate = char and char:FindFirstChild("Animate")
+		if not animate then return out end
+		for _, obj in ipairs(animate:GetDescendants()) do
+			if obj:IsA("Animation") then
+				local path = animationPath(animate, obj)
+				local id = path and anims[path] or nil
+				if type(id) == "string" and id ~= "" and obj.AnimationId ~= "" then
+					out[obj.AnimationId] = id
+				end
+			end
+		end
+		return out
+	end
+
+	local function cupSyncBuildPayload(data)
+		if type(data) ~= "table" then return nil end
+		local out = {
+			version = 5,
+			rigType = data.rigType,
+			description = data.description,
+			scales = data.scales,
+			bodyColors = data.bodyColors,
+			clothing = data.clothing,
+			face = data.face,
+			characterMeshes = data.characterMeshes,
+		}
+		if type(data.animations) == "table" then
+			local anims = {}
+			for path, id in pairs(data.animations) do
+				if type(path) == "string" and path ~= "" and type(id) == "string" and id ~= "" then
+					anims[path] = id
+				end
+			end
+			if next(anims) then out.animations = anims end
+		end
+		local animationMap = cupSyncBuildAnimationMap(data)
+		if next(animationMap) then out.animationMap = animationMap end
+		if type(data.parts) == "table" then
+			local parts = {}
+			for name, pdata in pairs(data.parts) do
+				if name ~= "HumanoidRootPart" then
+					local part = cupSyncCopyPart(pdata)
+					if part then parts[name] = part end
+				end
+			end
+			if next(parts) then out.parts = parts end
+		end
+		if type(data.accessoriesManual) == "table" then
+			local accs = {}
+			for _, adata in ipairs(data.accessoriesManual) do
+				local acc = cupSyncCopyAccessory(adata)
+				if acc then table.insert(accs, acc) end
+			end
+			if #accs > 0 then out.accessoriesManual = accs end
+		end
+		if tostring(out.rigType or ""):find("R6") and type(out.description) == "table" then
+			local desc = {}
+			for key, value in pairs(out.description) do
+				desc[key] = value
+			end
+			desc.accessories = nil
+			out.description = desc
+		end
+		return out
+	end
+
+	local function cupSyncEncode(payload)
+		local ok, encoded = pcall(function() return HttpService:JSONEncode(payload) end)
+		if ok and type(encoded) == "string" and #encoded <= SYNC_MAX_BYTES then
+			return encoded
+		end
+		local lean = {
+			version = 5,
+			rigType = payload.rigType,
+			description = payload.description,
+			scales = payload.scales,
+			bodyColors = payload.bodyColors,
+			clothing = payload.clothing,
+			face = payload.face,
+			characterMeshes = payload.characterMeshes,
+			animations = payload.animations,
+			animationMap = payload.animationMap,
+		}
+		if type(payload.parts) == "table" then
+			local parts = {}
+			for name, pdata in pairs(payload.parts) do
+				parts[name] = {
+					_class = pdata._class,
+					Size = pdata.Size,
+					Shape = pdata.Shape,
+					MeshId = pdata.MeshId,
+					TextureID = pdata.TextureID,
+					Color = pdata.Color,
+					Material = pdata.Material,
+					Transparency = pdata.Transparency,
+				}
+			end
+			lean.parts = parts
+		end
+		if type(payload.accessoriesManual) == "table" then
+			local accs = {}
+			for _, adata in ipairs(payload.accessoriesManual) do
+				table.insert(accs, {Name = adata.Name, accessoryType = adata.accessoryType, handle = adata.handle})
+			end
+			lean.accessoriesManual = accs
+		end
+		if type(lean.description) == "table" and type(lean.description.accessories) == "table" then
+			local desc = {}
+			for key, value in pairs(lean.description) do
+				desc[key] = value
+			end
+			local accs = {}
+			for index = 1, math.min(#desc.accessories, 6) do
+				accs[index] = desc.accessories[index]
+			end
+			desc.accessories = #accs > 0 and accs or nil
+			lean.description = desc
+		end
+		ok, encoded = pcall(function() return HttpService:JSONEncode(lean) end)
+		if ok and type(encoded) == "string" and #encoded <= SYNC_MAX_BYTES then
+			return encoded
+		end
+		return nil
+	end
+
+	local function cupSyncPublish(data)
+		if myRunId ~= _G.CupcakeRunId or not settings.serverSync or not syncState.ready or not syncState.publish then return false end
+		if data == nil or data == originalAvatarData then
+			if syncState.publishedJson ~= "" then
+				local fired, sent = pcall(function() return syncState.publish:FireServer("reset") end)
+				if not fired or sent == false then return false end
+				syncState.publishedJson = ""
+			end
+			return true
+		end
+		local payload = cupSyncBuildPayload(data)
+		if not payload then return true end
+		local encoded = cupSyncEncode(payload)
+		if not encoded then
+			notify("Cupcake", "This fit is too large to share with sync.", 5, true)
+			return true
+		end
+		if encoded == syncState.publishedJson then return true end
+		local fired, sent = pcall(function() return syncState.publish:FireServer("fit", encoded) end)
+		if not fired or sent == false then return false end
+		syncState.publishedJson = encoded
+		return true
+	end
+
+	local function cupSyncHookPlayer(plr)
+		if not plr or plr == player then return end
+		plr.CharacterAdded:Connect(function(char)
+			if myRunId ~= _G.CupcakeRunId then return end
+			local uid = plr.UserId
+			remoteOriginals[uid] = nil
+			remoteClone.restore(uid)
+			if not settings.serverSync then return end
+			local data = remoteFits[uid]
+			if data then
+				cupSyncQueue(plr, data)
+			end
+		end)
+	end
+
+	for _, plr in ipairs(Players:GetPlayers()) do
+		cupSyncHookPlayer(plr)
+	end
+	Players.PlayerAdded:Connect(function(plr)
+		if myRunId ~= _G.CupcakeRunId then return end
+		cupSyncHookPlayer(plr)
+	end)
+	Players.PlayerRemoving:Connect(function(plr)
+		if myRunId ~= _G.CupcakeRunId then return end
+		local uid = plr.UserId
+		remoteClone.restore(uid)
+		remoteFits[uid] = nil
+		remoteVersions[uid] = nil
+		remoteWanted[uid] = nil
+		remoteOriginals[uid] = nil
+		remotePlayers[uid] = nil
+		presence[uid] = nil
+	end)
+
+	player.CharacterAdded:Connect(function()
+		if myRunId ~= _G.CupcakeRunId then return end
+		if not settings.keepOnRespawn then
+			lastAppliedAvatarData = nil
+		end
+	end)
+
+	task.spawn(function()
+		while not scriptUnloaded and myRunId == _G.CupcakeRunId do
+			if settings.serverSync and syncState.ready then
+				local data = lastAppliedAvatarData
+				if data ~= syncState.lastData then
+					if cupSyncPublish(data) then
+						syncState.lastData = data
+					end
+				end
+			end
+			task.wait(0.4)
+		end
+	end)
+
+	task.spawn(function()
+		while not scriptUnloaded and myRunId == _G.CupcakeRunId do
+			if presenceMode == "ntfy" and settings.serverSync then
+				local now = os.clock()
+				local want = not presenceOn
+				if not want and now - presenceLastPublish >= PRESENCE_HEARTBEAT and cupPresenceHasPeer() then
+					want = true
+				end
+				if not want and presenceRespond and now - presenceLastPublish >= PRESENCE_RESPOND_GAP then
+					want = true
+				end
+				if want and now >= presenceNextAttempt then
+					if cupSyncNtfySendPresence("on") then
+						presenceOn = true
+						presenceLastPublish = os.clock()
+						presenceRespond = false
+					else
+						presenceNextAttempt = now + 15
+					end
+				end
+				if not want and presencePing and presenceOn and now >= presenceNextAttempt then
+					if cupSyncNtfySendPresence("ping") then
+						presencePing = false
+						presenceLastPublish = os.clock()
+					else
+						presenceNextAttempt = now + 15
+					end
+				end
+			elseif presenceMode == "server" and presenceRemote and settings.serverSync then
+				local now = os.clock()
+				if now >= presenceNextAttempt and now - presenceLastPublish >= PRESENCE_HEARTBEAT then
+					if pcall(function() presenceRemote:FireServer("on") end) then
+						presenceLastPublish = os.clock()
+					else
+						presenceNextAttempt = now + 15
+					end
+				end
+			end
+			task.wait(2)
+		end
+	end)
+
+	task.spawn(function()
+		while not scriptUnloaded and myRunId == _G.CupcakeRunId do
+			if presenceMode == "ntfy" and syncState.transport == "server" and syncState.ready and settings.serverSync then
+				cupSyncNtfyPoll(true)
+			end
+			task.wait(NTFY_POLL_SECONDS)
+		end
+	end)
+
+	return {
+		enable = cupSyncEnable,
+		disable = cupSyncDisable,
+		shutdown = cupSyncShutdown,
+		isPresent = cupPresenceIsPresent,
+	}
+end
+
+local cupSync = cupSetupSync()
 
 local function corner(radius, parent)
 	local c = Instance.new("UICorner")
@@ -3142,22 +4899,24 @@ local function setWorldBlur(enabled)
 	end
 end
 
-local DEFAULT_FOV = 70
-local MENU_FOV = 55
-local originalFov = DEFAULT_FOV
+local FOV = {
+	default = 70,
+	menu = 55,
+	original = 70,
+}
 
 local function setFov(target)
 	if not settings.fovChange then return end
 	local cam = workspace.CurrentCamera
 	if not cam then return end
-	originalFov = cam.FieldOfView
+	FOV.original = cam.FieldOfView
 	tween(cam, {FieldOfView = target}, 0.35, Enum.EasingStyle.Quart)
 end
 
 local function restoreFov()
 	local cam = workspace.CurrentCamera
 	if not cam then return end
-	tween(cam, {FieldOfView = originalFov}, 0.35, Enum.EasingStyle.Quart)
+	tween(cam, {FieldOfView = FOV.original}, 0.35, Enum.EasingStyle.Quart)
 end
 
 local function menuTintTransparency()
@@ -3296,13 +5055,13 @@ local function hideCoreGuis()
 	end)
 	pcall(function() StarterGui:SetCore("TopbarEnabled", false) end)
 	coreGuiOriginals = states
-	saveFile(COREUI_PATH, states)
+	saveFile(PATHS.coreui, states)
 end
 
 local function restoreCoreGuis()
 	local states = coreGuiOriginals
 	if type(states) ~= "table" then
-		local saved = loadFile(COREUI_PATH)
+		local saved = loadFile(PATHS.coreui)
 		if type(saved) == "table" and next(saved) then
 			states = saved
 		end
@@ -3312,7 +5071,7 @@ local function restoreCoreGuis()
 		pcall(function() StarterGui:SetCore("TopbarEnabled", true) end)
 	end
 	coreGuiOriginals = nil
-	if hasFS() then saveFile(COREUI_PATH, {}) end
+	if hasFS() then saveFile(PATHS.coreui, {}) end
 end
 
 local function hideOtherUis()
@@ -3347,11 +5106,11 @@ local function recoverHiddenUis()
 			end
 		end
 	end
-	local saved = loadFile(COREUI_PATH)
+	local saved = loadFile(PATHS.coreui)
 	if saved and next(saved) then
 		applyCoreGuiStates(saved)
 		pcall(function() StarterGui:SetCore("TopbarEnabled", true) end)
-		if hasFS() then saveFile(COREUI_PATH, {}) end
+		if hasFS() then saveFile(PATHS.coreui, {}) end
 	end
 end
 
@@ -3359,6 +5118,7 @@ local supersededConn
 supersededConn = RunService.Heartbeat:Connect(function()
 	if myRunId == _G.CupcakeRunId then return end
 	if supersededConn then supersededConn:Disconnect() end
+	pcall(function() remoteClone.restoreAll() end)
 
 	local pg = player:FindFirstChild("PlayerGui")
 	local activeGui = pg and pg:FindFirstChild("CupcakeGui")
@@ -3378,7 +5138,7 @@ supersededConn = RunService.Heartbeat:Connect(function()
 		_G.CupcakeUiAnimConnection = nil
 	end
 	pcall(function() setWorldBlur(false) end)
-	pcall(function() setFov(DEFAULT_FOV) end)
+	pcall(function() setFov(FOV.default) end)
 	if currentGui then
 		pcall(function() currentGui:Destroy() end)
 		currentGui = nil
@@ -3409,7 +5169,7 @@ local function toggleGui(force)
 			end)
 		end
 		setWorldBlur(false)
-		setFov(DEFAULT_FOV)
+		setFov(FOV.default)
 		local target = mf.Position
 		tween(mf, {Position = target + UDim2.new(0, 0, 0, 14)}, 0.18, Enum.EasingStyle.Quart)
 		task.delay(0.19, function()
@@ -3431,7 +5191,7 @@ local function toggleGui(force)
 			tween(bdOpen, {BackgroundTransparency = menuTintTransparency()}, 0.2)
 		end
 		setWorldBlur(true)
-		setFov(MENU_FOV)
+		setFov(FOV.menu)
 		local target = mf.Position
 		mf.Position = target + UDim2.new(0, 0, 0, 14)
 		tween(mf, {Position = target}, 0.22, Enum.EasingStyle.Quart)
@@ -3469,7 +5229,6 @@ local function paintChip(chip, colors)
 	end
 end
 
-local originalAvatarData = nil
 local resettingAvatar = false
 
 local rebindCallback = nil
@@ -3505,6 +5264,7 @@ end
 
 local function unloadScript()
 	if scriptUnloaded then return end
+	pcall(cupSync.shutdown)
 	scriptUnloaded = true
 	myRunId = nil
 	isGuiOpen = false
@@ -3559,7 +5319,7 @@ local function unloadScript()
 	pcall(function() UserInputService.MouseBehavior = Enum.MouseBehavior.Default end)
 	pcall(restoreHiddenUis)
 	pcall(function() setWorldBlur(false) end)
-	pcall(function() setFov(DEFAULT_FOV) end)
+	pcall(function() setFov(FOV.default) end)
 
 	if currentGui then
 		pcall(function() currentGui:Destroy() end)
@@ -3588,6 +5348,9 @@ end
 
 local function makeGui()
 	local pg = player:FindFirstChild("PlayerGui")
+	if not pg then
+		pcall(function() pg = player:WaitForChild("PlayerGui", 15) end)
+	end
 	if not pg then return nil end
 
 	if _G.CupcakeUiAnimConnection then
@@ -4272,7 +6035,7 @@ local function makeGui()
 	settingsPage.ScrollBarThickness = 3
 	settingsPage.ScrollBarImageColor3 = M3.Accent
 	settingsPage.ScrollBarImageTransparency = 0.3
-	settingsPage.CanvasSize = UDim2.new(0, 0, 0, 652)
+	settingsPage.CanvasSize = UDim2.new(0, 0, 0, 706)
 	settingsPage.ScrollingDirection = Enum.ScrollingDirection.Y
 	settingsPage.ElasticBehavior = Enum.ElasticBehavior.WhenScrollable
 	settingsPage.Visible = false
@@ -4814,7 +6577,7 @@ local function makeGui()
 		saveSettings()
 		if isGuiOpen then
 			if newValue then
-				setFov(MENU_FOV)
+				setFov(FOV.menu)
 			else
 				restoreFov()
 			end
@@ -4838,11 +6601,21 @@ local function makeGui()
 		saveSettings()
 	end)
 
+	makeSettingToggleRow("Row_ServerSync", "Server sync", 492, settings.serverSync, function(newValue)
+		settings.serverSync = newValue
+		saveSettings()
+		if newValue then
+			cupSync.enable()
+		else
+			cupSync.disable()
+		end
+	end)
+
 	local SCALE_MIN, SCALE_MAX = 0.75, 1.25
 	local scaleRow = Instance.new("Frame")
 	scaleRow.Name = "Row_MenuSize"
 	scaleRow.Size = UDim2.new(1, -8, 0, 48)
-	scaleRow.Position = UDim2.new(0, 4, 0, 492)
+	scaleRow.Position = UDim2.new(0, 4, 0, 546)
 	scaleRow.BackgroundColor3 = M3.Surface
 	scaleRow.BackgroundTransparency = 0.55
 	scaleRow.BorderSizePixel = 0
@@ -4963,7 +6736,7 @@ local function makeGui()
 	local snowRow = Instance.new("Frame")
 	snowRow.Name = "Row_EnableSnow"
 	snowRow.Size = UDim2.new(1, -8, 0, 48)
-	snowRow.Position = UDim2.new(0, 4, 0, 546)
+	snowRow.Position = UDim2.new(0, 4, 0, 600)
 	snowRow.BackgroundColor3 = M3.Surface
 	snowRow.BackgroundTransparency = 0.55
 	snowRow.BorderSizePixel = 0
@@ -5003,7 +6776,7 @@ local function makeGui()
 	local unloadRow = Instance.new("Frame")
 	unloadRow.Name = "Row_Unload"
 	unloadRow.Size = UDim2.new(1, -8, 0, 48)
-	unloadRow.Position = UDim2.new(0, 4, 0, 600)
+	unloadRow.Position = UDim2.new(0, 4, 0, 654)
 	unloadRow.BackgroundColor3 = M3.Surface
 	unloadRow.BackgroundTransparency = 0.55
 	unloadRow.BorderSizePixel = 0
@@ -5552,7 +7325,27 @@ local function makeGui()
 	toastLabel.Parent = toast
 
 	local toastConn = nil
+	local toastToken = 0
 	showToast = function(msg)
+		if scriptUnloaded then return end
+		toastToken = toastToken + 1
+		local token = toastToken
+		if toastConn then
+			pcall(function() toastConn:Cancel() end)
+			toastConn = nil
+		end
+		toastLabel.Text = tostring(msg or "")
+		toast.Visible = true
+		toast.Position = UDim2.new(0.5, -115, 1, -8)
+		toast.BackgroundTransparency = 0.72
+		tween(toast, {Position = UDim2.new(0.5, -115, 1, -54), BackgroundTransparency = 0.38}, 0.18)
+		toastConn = task.delay(2.2, function()
+			if token ~= toastToken or scriptUnloaded then return end
+			tween(toast, {Position = UDim2.new(0.5, -115, 1, -8), BackgroundTransparency = 0.72}, 0.2)
+			task.delay(0.22, function()
+				if token == toastToken then toast.Visible = false end
+			end)
+		end)
 	end
 	showToastRef = showToast
 
@@ -5823,7 +7616,7 @@ local function makeGui()
 				settings.autoloadName = name
 				saveSettings()
 			end
-			if hasFS() then saveFile(SAVES_PATH, savedAvatars) end
+			if hasFS() then saveFile(PATHS.saves, savedAvatars) end
 			refreshAutoloadLabel()
 			refreshGrid()
 			closeModal()
@@ -5982,6 +7775,9 @@ local function makeGui()
 		closeOptionsMenu(true)
 		if UpdateAvatar(target) then
 			refreshGrid()
+			showToast("Updated " .. target)
+		else
+			showToast("Could not update " .. target)
 		end
 	end)
 
@@ -6225,7 +8021,7 @@ local function makeGui()
 		unlockMouse()
 		hideOtherUis()
 		setWorldBlur(true)
-		setFov(MENU_FOV)
+		setFov(FOV.menu)
 		if settings.snow then pcall(startSnow) end
 		updateCircle()
 		closeLoading()
@@ -6292,7 +8088,7 @@ end)
 loadSettings()
 
 if hasFS() then
-	savedAvatars = loadFile(SAVES_PATH) or {}
+	savedAvatars = loadFile(PATHS.saves) or {}
 end
 
 recoverHiddenUis()
@@ -6328,6 +8124,10 @@ if settings.autoloadName ~= "" then
 	end
 end
 
+if settings.serverSync then
+	cupSync.enable()
+end
+
 if isGuiOpen and currentGui then
 	unlockMouse()
 	hideOtherUis()
@@ -6337,7 +8137,7 @@ if isGuiOpen and currentGui then
 		bdInit.BackgroundTransparency = menuTintTransparency()
 	end
 	setWorldBlur(true)
-	setFov(MENU_FOV)
+	setFov(FOV.menu)
 	if startSnow and settings.snow then pcall(startSnow) end
 	updateCircle()
 end
@@ -6361,4 +8161,137 @@ local function reapplyOnRespawn(char)
 end
 
 respawnConn = player.CharacterAdded:Connect(reapplyOnRespawn)
-print("github test2")
+
+do
+	local tabCupcakeAsset = "rbxassetid://11424083474"
+	local tabOriginals = rawget(_G, "CupcakeTabOriginals")
+	if type(tabOriginals) ~= "table" then
+		tabOriginals = setmetatable({}, {__mode = "k"})
+		_G.CupcakeTabOriginals = tabOriginals
+	end
+
+	local function saveTabOriginal(builtIn)
+		local saved = tabOriginals[builtIn]
+		if saved then return saved end
+		saved = {visible = builtIn.Visible}
+		if builtIn:IsA("TextLabel") then
+			saved.textTransparency = builtIn.TextTransparency
+			saved.backgroundTransparency = builtIn.BackgroundTransparency
+		elseif builtIn:IsA("ImageLabel") then
+			saved.imageTransparency = builtIn.ImageTransparency
+			saved.backgroundTransparency = builtIn.BackgroundTransparency
+		elseif builtIn:IsA("Frame") then
+			saved.backgroundTransparency = builtIn.BackgroundTransparency
+		end
+		tabOriginals[builtIn] = saved
+		return saved
+	end
+
+	local function hideTabBuiltIn(builtIn)
+		saveTabOriginal(builtIn)
+		builtIn.Visible = false
+		if builtIn:IsA("TextLabel") then
+			builtIn.BackgroundTransparency = 1
+			builtIn.TextTransparency = 1
+		elseif builtIn:IsA("ImageLabel") then
+			builtIn.BackgroundTransparency = 1
+			builtIn.ImageTransparency = 1
+		elseif builtIn:IsA("Frame") then
+			builtIn.BackgroundTransparency = 1
+		end
+	end
+
+	local function restoreTabBuiltIn(builtIn)
+		local saved = tabOriginals[builtIn]
+		if not saved then return end
+		builtIn.Visible = saved.visible
+		if saved.backgroundTransparency ~= nil then builtIn.BackgroundTransparency = saved.backgroundTransparency end
+		if saved.textTransparency ~= nil then builtIn.TextTransparency = saved.textTransparency end
+		if saved.imageTransparency ~= nil then builtIn.ImageTransparency = saved.imageTransparency end
+		tabOriginals[builtIn] = nil
+	end
+
+	local function updateTabCupcake(entry, active)
+		if not entry or not entry:IsA("Frame") then return end
+		local content = entry:FindFirstChild("PlayerEntryContentFrame")
+		local overlay = content and content:FindFirstChild("OverlayFrame")
+		local nameFrame = overlay and overlay:FindFirstChild("NameFrame")
+		if not nameFrame then return end
+		local builtIn = nameFrame:FindFirstChild("PlayerIcon")
+		if builtIn and builtIn:IsA("GuiObject") then
+			if active then
+				hideTabBuiltIn(builtIn)
+			else
+				restoreTabBuiltIn(builtIn)
+			end
+		end
+		local spacer = nameFrame:FindFirstChild("CupcakeTabSpacer")
+		local icon = entry:FindFirstChild("CupcakeTabIcon")
+		if active then
+			if not spacer then
+				spacer = Instance.new("Frame")
+				spacer.Name = "CupcakeTabSpacer"
+				spacer.Size = UDim2.fromOffset(16, 16)
+				spacer.BackgroundTransparency = 1
+				spacer.BorderSizePixel = 0
+				spacer.LayoutOrder = -100
+				spacer.Parent = nameFrame
+			end
+			if not icon then
+				icon = Instance.new("ImageLabel")
+				icon.Name = "CupcakeTabIcon"
+				icon.Position = UDim2.fromOffset(12, 12)
+				icon.Size = UDim2.fromOffset(16, 16)
+				icon.BackgroundTransparency = 1
+				icon.BorderSizePixel = 0
+				icon.Image = tabCupcakeAsset
+				icon.ImageColor3 = Color3.fromRGB(255, 255, 255)
+				icon.ImageTransparency = 0
+				icon.ScaleType = Enum.ScaleType.Fit
+				icon.ZIndex = 50
+				icon.Parent = entry
+			end
+		else
+			if spacer then spacer:Destroy() end
+			if icon then icon:Destroy() end
+		end
+	end
+
+	task.spawn(function()
+		while myRunId == _G.CupcakeRunId and not _G.CupcakeUnloaded do
+			local ok, coreGui = pcall(function()
+				return game:GetService("CoreGui")
+			end)
+			if ok and coreGui then
+				local list = coreGui:FindFirstChild("PlayerList")
+				if list then
+					for _, obj in ipairs(list:GetDescendants()) do
+						if obj:IsA("Frame") then
+							local uid = tonumber(obj.Name:match("^PlayerEntry_(%d+)$"))
+							if uid then
+								pcall(updateTabCupcake, obj, cupSync.isPresent(uid))
+							end
+						end
+					end
+				end
+			end
+			task.wait(0.5)
+		end
+		if _G.CupcakeUnloaded or scriptUnloaded then
+			pcall(function()
+				local coreGui = game:GetService("CoreGui")
+				local list = coreGui and coreGui:FindFirstChild("PlayerList")
+				if list then
+					for _, obj in ipairs(list:GetDescendants()) do
+						if obj.Name == "CupcakeTabIcon" or obj.Name == "CupcakeTabSpacer" then
+							obj:Destroy()
+						elseif obj.Name == "PlayerIcon" and obj:IsA("GuiObject") then
+							restoreTabBuiltIn(obj)
+						end
+					end
+				end
+			end)
+			_G.CupcakeTabOriginals = nil
+		end
+	end)
+end
